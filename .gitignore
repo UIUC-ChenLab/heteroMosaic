@@ -1,0 +1,21 @@
+# build directory 
+/build
+
+# model_weights directories (general pattern)
+**/model_weights/
+*/model_weights/
+
+#plots
+**/plots/
+*/plots/
+/py/tileFuse_figs/results/benchmark_*.txt
+/py/heteroMosaic_figs/results/benchmark_*.txt
+
+# environment
+/util/rocmPytorch
+
+# python bytecode/cache artifacts
+__pycache__/
+**/__pycache__/
+*.pyc
+.cache/

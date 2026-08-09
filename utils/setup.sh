@@ -18,17 +18,8 @@ if [ -d "$HETEROMOSAIC_ROOT/utils/rocmPytorch/lib/python3.12/site-packages/torch
     export LD_LIBRARY_PATH="$HETEROMOSAIC_ROOT/utils/rocmPytorch/lib/python3.12/site-packages/torch/lib:$LD_LIBRARY_PATH"
 fi
 
-if [ -n "${ROCM_PATH:-}" ] && [ -d "$ROCM_PATH" ]; then
-    export ROCM_PATH
-elif [ -d /opt/rocm ]; then
-    export ROCM_PATH=/opt/rocm
-elif [ -d /opt/rocm-7.2.0 ]; then
-    export ROCM_PATH=/opt/rocm-7.2.0
-else
-    export ROCM_PATH=/opt/rocm
-fi
-
-echo "Using ROCm (${ROCM_PATH})"
+export ROCM_PATH=/opt/rocm-7.1.1
+echo "Using ROCm 7.1.1 ($ROCM_PATH)"
 
 export PATH=$ROCM_PATH/bin:$PATH
 export LD_LIBRARY_PATH=$ROCM_PATH/lib:$ROCM_PATH/lib64:$LD_LIBRARY_PATH

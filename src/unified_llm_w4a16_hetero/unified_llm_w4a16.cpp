@@ -2256,7 +2256,7 @@ torch::Tensor UnifiedLLMW4A16Impl::forward_llama3_chunked(torch::Tensor x, int64
             std::async(std::launch::async,
                        [this, chunk, s, is_last_chunk, slot_id, chunk_id, &slot_streams, &kv_ready_events, &chunk_layer_progress]() {
                            torch::NoGradGuard no_grad_guard;
-                           c10::hip::HIPStreamGuard stream_guard(slot_streams[static_cast<size_t>(slot_id)]);
+                           c10::cuda::CUDAStreamGuard stream_guard(slot_streams[static_cast<size_t>(slot_id)]);
                            auto &slot_buffers = llama_pipeline_scratch_slots[static_cast<size_t>(slot_id)];
                            return this->forward_llama3_with_scratch(
                                chunk, s, is_last_chunk, is_last_chunk, slot_buffers.queries_buffer, slot_buffers.keys_buffer,
@@ -2687,7 +2687,7 @@ torch::Tensor UnifiedLLMW4A16Impl::forward_gemma_chunked(torch::Tensor x, int64_
         slot_futures[static_cast<size_t>(slot_id)] =
             std::async(std::launch::async, [this, chunk, s, slot_id, chunk_id, &slot_streams, &kv_ready_events, &chunk_layer_progress]() {
                 torch::NoGradGuard no_grad_guard;
-                c10::hip::HIPStreamGuard stream_guard(slot_streams[static_cast<size_t>(slot_id)]);
+                c10::cuda::CUDAStreamGuard stream_guard(slot_streams[static_cast<size_t>(slot_id)]);
                 auto &slot_buffers = llama_pipeline_scratch_slots[static_cast<size_t>(slot_id)];
                 return this->forward_gemma_with_scratch(
                     chunk, s, slot_buffers.queries_buffer, slot_buffers.keys_buffer, slot_buffers.values_buffer, slot_buffers.qkv_buffer,
@@ -3056,7 +3056,7 @@ torch::Tensor UnifiedLLMW4A16Impl::forward_qwen25_chunked_impl(torch::Tensor x, 
                        [this, chunk, s, slot_id, chunk_id, is_last_chunk, use_fused_qkv, &slot_streams, &kv_ready_events,
                         &chunk_layer_progress, &ready_mutex, &ready_cv, &ready_slots]() {
                            torch::NoGradGuard no_grad_guard;
-                           c10::hip::HIPStreamGuard stream_guard(slot_streams[static_cast<size_t>(slot_id)]);
+                           c10::cuda::CUDAStreamGuard stream_guard(slot_streams[static_cast<size_t>(slot_id)]);
                            auto &slot_buffers = llama_pipeline_scratch_slots[static_cast<size_t>(slot_id)];
                            auto result = use_fused_qkv
                                              ? this->forward_qwen25small_with_scratch(
@@ -3539,7 +3539,7 @@ torch::Tensor UnifiedLLMW4A16Impl::forward_phi3_chunked(torch::Tensor x, int64_t
         slot_futures[static_cast<size_t>(slot_id)] =
             std::async(std::launch::async, [this, chunk, s, slot_id, chunk_id, &slot_streams, &kv_ready_events, &chunk_layer_progress]() {
                 torch::NoGradGuard no_grad_guard;
-                c10::hip::HIPStreamGuard stream_guard(slot_streams[static_cast<size_t>(slot_id)]);
+                c10::cuda::CUDAStreamGuard stream_guard(slot_streams[static_cast<size_t>(slot_id)]);
                 auto &slot_buffers = llama_pipeline_scratch_slots[static_cast<size_t>(slot_id)];
                 return this->forward_phi3_with_scratch(
                     chunk, s, slot_buffers.queries_buffer, slot_buffers.keys_buffer, slot_buffers.values_buffer,

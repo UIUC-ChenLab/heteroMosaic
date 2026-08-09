@@ -24,15 +24,23 @@ if(TORCH_PYTHON_PATH AND EXISTS "${TORCH_PYTHON_PATH}/share/cmake/Torch")
 else()
     # Fallback to LibTorch path
     # Fallback to LibTorch path
-    set(CMAKE_PREFIX_PATH "${HOME_LIBS}/libtorch_7.1.0")
-    set(TORCH_PYTHON_PATH "${HOME_LIBS}/libtorch_7.1.0")
+    set(CMAKE_PREFIX_PATH "${HOME_LIBS}/libtorch_7.2")
+    set(TORCH_PYTHON_PATH "${HOME_LIBS}/libtorch_7.2")
 endif()
 
 # Set the XDNA driver path
 set(DRIVER_PATH "${HOME_LIBS}/xdna-driver-05-19-25")
 
-# Pin the toolchain to the ROCm 7.1.1 installation.
-set(ROCM_PATH "/opt/rocm-7.1.1")
+# Set ROCm path
+if(DEFINED ENV{ROCM_PATH} AND EXISTS "$ENV{ROCM_PATH}")
+    set(ROCM_PATH "$ENV{ROCM_PATH}")
+elseif(EXISTS "/opt/rocm")
+    set(ROCM_PATH "/opt/rocm")
+elseif(EXISTS "/opt/rocm-7.2.0")
+    set(ROCM_PATH "/opt/rocm-7.2.0")
+else()
+    set(ROCM_PATH "/opt/rocm")
+endif()
 set(ENV{ROCM_PATH} "${ROCM_PATH}")
 message(STATUS "Using ROCM_PATH: ${ROCM_PATH}")
 link_directories(${ROCM_PATH}/lib)

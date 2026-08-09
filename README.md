@@ -6,9 +6,9 @@ This guide describes how to replicate the `libraries` directory in a directory o
 
 ## Prerequisites
 
-### 1. ROCm 7.1.1
-Ensure ROCm 7.1.1 is installed at `/opt/rocm-7.1.1`.
-Reference: [ROCm Quick Start Guide](https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.1.1/install/quick-start.html)
+### 1. ROCm 7.2
+Ensure ROCm 7.2 is installed on your system.
+Reference: [ROCm Quick Start Guide](https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.2.0/install/quick-start.html)
 
 ### 2. AOCL (AMD Optimizing CPU Libraries)
 Instructions and downloads can be found here:
@@ -82,21 +82,21 @@ source ~/.bashrc
 
 ### 1. Setup LibTorch
 
-`heteroMosaic` first tries to discover PyTorch from the active Python environment. If that is unavailable, it falls back to `${HOME_LIBS}/libtorch_7.1.0`.
+`heteroMosaic` first tries to discover PyTorch from the active Python environment. If that is unavailable, it falls back to `${HOME_LIBS}/libtorch_7.2`.
 
 ```bash
 mkdir -p "$HOME_LIBS"
 cd "$HOME_LIBS"
-wget https://download.pytorch.org/libtorch/rocm7.1/libtorch-shared-with-deps-2.10.0%2Brocm7.1.zip
-unzip libtorch-shared-with-deps-2.10.0+rocm7.1.zip
-mv libtorch libtorch_7.1.0
-rm libtorch-shared-with-deps-2.10.0+rocm7.1.zip
+wget https://download.pytorch.org/libtorch/rocm7.2/libtorch-shared-with-deps-2.11.0%2Brocm7.2.zip
+unzip libtorch-shared-with-deps-2.11.0+rocm7.2.zip
+mv libtorch libtorch_7.2
+rm libtorch-shared-with-deps-2.11.0+rocm7.2.zip
 ```
 
 After extraction, the expected layout is:
 
 ```bash
-$HOME_LIBS/libtorch_7.1.0/
+$HOME_LIBS/libtorch_7.2/
   bin/
   include/
   lib/
@@ -157,8 +157,8 @@ source new_setup.sh
 ```
 This script:
 - creates a fresh `utils/rocmPytorch` virtual environment
-- installs ROCm 7.1 Python packages from `requirements_rocm7.1.txt`, matching the ROCm 7.1.1 system installation
-- installs the remaining model and benchmark dependencies used by the project
+- installs ROCm 7.2 Python packages from `requirements_rocm7.2.txt`
+- installs the rest of the Python dependencies from `requirements.txt`
 
 > [!IMPORTANT]
 > This script will fail if ROCm is not correctly set up.
@@ -174,7 +174,7 @@ In the new terminal, navigate to the project root and follow these steps:
    ```
    This script activates the virtual environment and exports the main runtime variables used by the build:
    - `HETEROMOSAIC_ROOT`
-   - `ROCM_PATH=/opt/rocm-7.1.1`
+   - `ROCM_PATH` pointing at your ROCm installation, typically `/opt/rocm`
    - `HSA_OVERRIDE_GFX_VERSION=11.0.0` on non-`AMD RYZEN AI MAX+ 395 w/ Radeon 8060S` systems
 
 2. **Run CMake and Build**:

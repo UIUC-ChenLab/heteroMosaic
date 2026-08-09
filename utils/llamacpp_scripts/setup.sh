@@ -68,8 +68,16 @@ fi
 
 cd "$LLAMA_DIR"
 
-# Use system ROCm 7.1.1 directly (avoid pulling in heteroMosaic's environment).
-ROCM_PATH="/opt/rocm-7.1.1"
+# Use system ROCm install directly (avoid pulling in heteroMosaic's env)
+if [[ -n "${ROCM_PATH:-}" && -d "$ROCM_PATH" ]]; then
+  ROCM_PATH="$ROCM_PATH"
+elif [[ -d /opt/rocm ]]; then
+  ROCM_PATH="/opt/rocm"
+elif [[ -d /opt/rocm-7.2.0 ]]; then
+  ROCM_PATH="/opt/rocm-7.2.0"
+else
+  ROCM_PATH="/opt/rocm"
+fi
 
 if [[ ! -d "$ROCM_PATH" ]]; then
   echo "ERROR: ROCm path not found: $ROCM_PATH" >&2

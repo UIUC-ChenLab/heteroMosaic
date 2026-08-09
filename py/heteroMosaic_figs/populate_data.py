@@ -9,6 +9,8 @@ from pathlib import Path
 
 DEFAULT_INPUT_PATH = Path(__file__).resolve().parent / "results"
 RESULTS_DIR = DEFAULT_INPUT_PATH
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BUILD_RESULTS_DIR = REPO_ROOT / "build" / "results"
 
 # Default model target for results population.
 # Available values:
@@ -21,23 +23,34 @@ MODEL = "llama3_8b"
 MODEL_CONFIGS = {
     "gemma": {
         "output_json": RESULTS_DIR / "gemma_results.json",
-        "summary_aliases": ("gemma",),
+        "summary_aliases": ("gemma", "gemma1-2b_q4_k_s"),
+        "heteromosaic_script": "gemma_w4a16_model.py",
     },
     "llama3_8b": {
         "output_json": RESULTS_DIR / "llama3-8b_results.json",
-        "summary_aliases": ("llama3-8b", "llama3_8b", "llama3"),
+        "summary_aliases": ("llama3-8b", "llama3_8b", "llama3", "llama3-8b_q4_k_s"),
+        "heteromosaic_script": "llama3_8b_w4a16_model.py",
     },
     "llama3_70b": {
         "output_json": RESULTS_DIR / "llama3-70b_results.json",
-        "summary_aliases": ("llama3-70b", "llama3_70b", "llama3 70b"),
+        "summary_aliases": ("llama3-70b", "llama3_70b", "llama3 70b", "llama3-70b_q4_k_s"),
+        "heteromosaic_script": "llama3_70b_w4a16_model.py",
     },
     "qwen14b": {
         "output_json": RESULTS_DIR / "qwen14b_results.json",
-        "summary_aliases": ("qwen14b", "qwen2.5-14b", "qwen25-14b"),
+        "summary_aliases": ("qwen14b", "qwen2.5-14b", "qwen25-14b", "qwen2.5-14b_q4_k_s"),
+        "heteromosaic_script": "qwen25_14b_w4a16_model.py",
     },
     "phi35_3.8b": {
         "output_json": RESULTS_DIR / "phi35_3.8b_results.json",
-        "summary_aliases": ("phi35_3.8b", "phi3.5-3.8b", "phi3.5_3.8b", "phi35-3.8b"),
+        "summary_aliases": (
+            "phi35_3.8b",
+            "phi3.5-3.8b",
+            "phi3.5_3.8b",
+            "phi35-3.8b",
+            "phi3.5-3.8b_q4_k_s",
+        ),
+        "heteromosaic_script": "phi35_3.8b_w4a16_model.py",
     },
 }
 
@@ -75,6 +88,24 @@ def parse_args() -> argparse.Namespace:
         help="Top-level JSON key for single-file mode; ignored when auto-loading benchmark_*.txt files",
     )
     parser.add_argument(
+        "--machine",
+        choices=sorted(PLATFORM_NAME_MAP),
+        default=None,
+        help="Machine id for machine-scoped output and platform naming (350, 370, or 395).",
+    )
+    parser.add_argument(
+        "--heteromosaic-input",
+        type=Path,
+        default=None,
+        help="HeteroMosaic benchmark.json state or captured benchmark stdout.",
+    )
+    parser.add_argument(
+        "--llamacpp-input",
+        type=Path,
+        default=None,
+        help="llama.cpp benchmark.json state or captured benchmark stdout.",
+    )
+    parser.add_argument(
         "--model",
         default=MODEL,
         help=(
@@ -107,9 +138,11 @@ def get_model_config(model_id: str | None) -> dict:
     return MODEL_CONFIGS[selected_model]
 
 
-def resolve_output_path(requested_output: Path | None, model_config: dict) -> Path:
+def resolve_output_path(requested_output: Path | None, model_config: dict, machine_id: str | None = None) -> Path:
     if requested_output is not None:
         return requested_output.resolve()
+    if machine_id is not None:
+        return (BUILD_RESULTS_DIR / machine_id / Path(model_config["output_json"]).name).resolve()
     return Path(model_config["output_json"]).resolve()
 
 
@@ -148,23 +181,43 @@ def discover_input_files(input_path: Path) -> list[Path]:
 
 
 def classify_scenario(scenario: str) -> str | None:
-    if scenario.startswith("gpu/"):
+    normalized = scenario.strip().lower()
+    if normalized.startswith("gpu/") or normalized.startswith("backend=gpu,"):
         return "iGPU"
-    if scenario.startswith("npu/"):
+    if normalized.startswith("npu/") or normalized.startswith("backend=npu,"):
         return "npu"
-    if scenario.startswith("hetero/c=0/"):
+    if normalized.startswith("hetero/c=0/") or (
+        normalized.startswith("backend=hetero,") and "chunking=false" in normalized
+    ):
         return "HeteroInfer"
-    if scenario.startswith("hetero/c=1/"):
+    if normalized.startswith("hetero/c=1/") or (
+        normalized.startswith("backend=hetero,") and "chunking=true" in normalized
+    ):
         return "HeteroMosaic"
     return None
 
 
-def update_prefill_best(results: dict[str, dict[str, float]], size: str, scenario: str, prefill: float) -> None:
-    bucket = results.setdefault(size, {})
-    category = classify_scenario(scenario)
+def classify_case(case: dict) -> str | None:
+    backend = str(case.get("backend", "")).strip().lower()
+    if backend == "gpu":
+        return "iGPU"
+    if backend == "npu":
+        return "npu"
+    if backend == "hetero":
+        return "HeteroMosaic" if bool(case.get("chunking")) else "HeteroInfer"
+    return None
+
+
+def update_prefill_category(
+    results: dict[str, dict[str, float]],
+    size: str,
+    category: str | None,
+    prefill: float,
+) -> None:
     if category is None:
         return
 
+    bucket = results.setdefault(size, {})
     if category in {"iGPU", "npu", "HeteroMosaic"}:
         current = bucket.get(category)
         if current is None or prefill < current:
@@ -175,6 +228,10 @@ def update_prefill_best(results: dict[str, dict[str, float]], size: str, scenari
         current = bucket.get(category)
         if current is None or prefill > current:
             bucket[category] = prefill
+
+
+def update_prefill_best(results: dict[str, dict[str, float]], size: str, scenario: str, prefill: float) -> None:
+    update_prefill_category(results, size, classify_scenario(scenario), prefill)
 
 
 def parse_benchmark_rows(text: str) -> tuple[dict[str, dict[str, float]], list[str]]:
@@ -200,6 +257,94 @@ def parse_benchmark_rows(text: str) -> tuple[dict[str, dict[str, float]], list[s
         update_prefill_best(prefill_by_size, size, scenario, prefill)
 
     return prefill_by_size, seen_sizes
+
+
+def load_json_state(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Could not read benchmark state JSON {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"Benchmark state must contain a JSON object: {path}")
+    return payload
+
+
+def parse_heteromosaic_state(
+    state: dict,
+    model_config: dict,
+) -> tuple[dict[str, dict[str, float]], list[str]]:
+    expected_script = model_config.get("heteromosaic_script")
+    cached_script = state.get("script")
+    if expected_script and cached_script != expected_script:
+        raise SystemExit(
+            f"HeteroMosaic cache contains script '{cached_script}', expected '{expected_script}'. "
+            "Run the requested model benchmark first."
+        )
+
+    prefill_by_size: dict[str, dict[str, float]] = {}
+    seen_sizes: list[str] = []
+    for case in state.get("cases", []):
+        if not isinstance(case, dict) or case.get("status") != "done":
+            continue
+        metrics = case.get("metrics")
+        if not isinstance(metrics, dict):
+            continue
+        try:
+            size = str(int(case["prompt_size"]))
+            prefill = float(metrics["prefill_s"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if prefill <= 0:
+            continue
+        if size not in seen_sizes:
+            seen_sizes.append(size)
+        update_prefill_category(
+            prefill_by_size,
+            size,
+            classify_case(case),
+            prefill,
+        )
+
+    if not seen_sizes:
+        raise SystemExit("No completed HeteroMosaic benchmark cases were found in the cache.")
+    return prefill_by_size, seen_sizes
+
+
+def parse_llamacpp_state(
+    state: dict,
+    benchmark_sizes: list[str],
+    requested_model: str,
+) -> dict[str, float]:
+    model_config = get_model_config(requested_model)
+    aliases = {
+        normalize_model_name(requested_model),
+        *(normalize_model_name(alias) for alias in model_config.get("summary_aliases", ())),
+    }
+    requested_sizes = set(benchmark_sizes)
+    results: dict[str, float] = {}
+    for case in state.get("cases", []):
+        if not isinstance(case, dict) or case.get("status") != "done":
+            continue
+        if normalize_model_name(str(case.get("model", ""))) not in aliases:
+            continue
+        result = case.get("result")
+        if not isinstance(result, dict):
+            continue
+        try:
+            size = str(int(case["prompt_size"]))
+            ttft = float(result["ttft"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if size in requested_sizes and ttft > 0:
+            results[size] = ttft
+
+    missing_sizes = sorted(requested_sizes - set(results), key=int)
+    if missing_sizes:
+        raise SystemExit(
+            "llama.cpp cache is missing completed TTFT results for prompt sizes: "
+            + ", ".join(missing_sizes)
+        )
+    return results
 
 
 def infer_model_and_llamacpp(text: str, benchmark_sizes: list[str], requested_model: str | None) -> tuple[str, dict[str, float]]:
@@ -283,24 +428,71 @@ def build_output(
 
 def main() -> int:
     args = parse_args()
-    input_path = args.input_path.resolve()
-    input_files = discover_input_files(input_path)
     model_config = get_model_config(args.model)
+    if args.machine and args.platform:
+        raise SystemExit("Use either --machine or --platform, not both.")
+    if (args.heteromosaic_input is None) != (args.llamacpp_input is None):
+        raise SystemExit("--heteromosaic-input and --llamacpp-input must be provided together.")
 
     output: dict[str, dict[str, dict[str, list[float] | list[str]]]] = {}
     model_name: str | None = args.model
 
-    for input_txt in input_files:
-        text = input_txt.read_text(encoding="utf-8")
-        prefill_by_size, benchmark_sizes = parse_benchmark_rows(text)
-        current_model_name, llamacpp_by_size = infer_model_and_llamacpp(text, benchmark_sizes, args.model)
+    if args.heteromosaic_input is not None and args.llamacpp_input is not None:
+        heteromosaic_input = args.heteromosaic_input.resolve()
+        llamacpp_input = args.llamacpp_input.resolve()
+        for input_path in (heteromosaic_input, llamacpp_input):
+            if not input_path.is_file():
+                raise SystemExit(f"Input file does not exist: {input_path}")
+
+        if heteromosaic_input.suffix.lower() == ".json":
+            prefill_by_size, benchmark_sizes = parse_heteromosaic_state(
+                load_json_state(heteromosaic_input),
+                model_config,
+            )
+        else:
+            heteromosaic_text = heteromosaic_input.read_text(encoding="utf-8")
+            prefill_by_size, benchmark_sizes = parse_benchmark_rows(heteromosaic_text)
+
+        if llamacpp_input.suffix.lower() == ".json":
+            current_model_name = args.model
+            llamacpp_by_size = parse_llamacpp_state(
+                load_json_state(llamacpp_input),
+                benchmark_sizes,
+                args.model,
+            )
+        else:
+            llamacpp_text = llamacpp_input.read_text(encoding="utf-8")
+            current_model_name, llamacpp_by_size = infer_model_and_llamacpp(
+                llamacpp_text,
+                benchmark_sizes,
+                args.model,
+            )
         if model_name is None:
             model_name = current_model_name
-
-        platform_name = infer_platform_name(input_txt, args.platform if len(input_files) == 1 else None)
+        platform_name = (
+            PLATFORM_NAME_MAP[args.machine]
+            if args.machine is not None
+            else (args.platform or heteromosaic_input.stem)
+        )
         output[platform_name] = build_output(prefill_by_size, llamacpp_by_size)
+    else:
+        input_path = args.input_path.resolve()
+        input_files = discover_input_files(input_path)
+        for input_txt in input_files:
+            text = input_txt.read_text(encoding="utf-8")
+            prefill_by_size, benchmark_sizes = parse_benchmark_rows(text)
+            current_model_name, llamacpp_by_size = infer_model_and_llamacpp(text, benchmark_sizes, args.model)
+            if model_name is None:
+                model_name = current_model_name
 
-    output_path = resolve_output_path(args.output, model_config)
+            explicit_platform = args.platform if len(input_files) == 1 else None
+            if args.machine is not None and len(input_files) == 1:
+                explicit_platform = PLATFORM_NAME_MAP[args.machine]
+            platform_name = infer_platform_name(input_txt, explicit_platform)
+            output[platform_name] = build_output(prefill_by_size, llamacpp_by_size)
+
+    output_path = resolve_output_path(args.output, model_config, args.machine)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(output, indent=4) + "\n", encoding="utf-8")
 
     print(f"Model: {model_name}")

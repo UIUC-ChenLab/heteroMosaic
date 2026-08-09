@@ -2,9 +2,18 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
-LLAMA_DIR="$ROOT_DIR/llama.cpp"
+cd "$ROOT_DIR"
+
+PROJECT_BUILD_DIR="../../build"
+LLAMA_DIR="$PROJECT_BUILD_DIR/llama.cpp"
 SETUP_SCRIPT="$ROOT_DIR/setup.sh"
 DEFAULT_REPO="https://github.com/ggerganov/llama.cpp.git"
+
+if [[ ! -d "$PROJECT_BUILD_DIR" ]]; then
+    echo "ERROR: Project build directory not found: $PROJECT_BUILD_DIR" >&2
+    echo "Build the project first, then run this script again." >&2
+    exit 1
+fi
 
 if [[ ! -d "$LLAMA_DIR" ]]; then
     echo "llama.cpp directory not found. Cloning..."

@@ -19,18 +19,55 @@ Instructions and downloads can be found here:
 
 Install the recommended kernel and configure GRUB for large GTT (Graphics Translation Table) memory. Do this **before** running the library setup steps below.
 
-**Install kernel 6.11.0-26-generic (e.g. Ubuntu 24.04):**
+**Install kernel 6.11.0-26-generic (Ubuntu 24.04.4, amd64):**
+
+The required `6.11.0-26.26~24.04.1` packages are no longer available through
+the current Ubuntu package index. Download the unmodified packages directly
+from Canonical's Launchpad archive into `utils/kernel_6.11.0-26`:
+
+```bash
+cd /path/to/heteroMosaic
+kernel_dir="utils/kernel_6.11.0-26"
+mkdir -p "$kernel_dir"
+
+wget --continue --https-only --directory-prefix="$kernel_dir" \
+  https://launchpadlibrarian.net/789269712/linux-image-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb \
+  https://launchpadlibrarian.net/788568255/linux-headers-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb \
+  https://launchpadlibrarian.net/788568258/linux-hwe-6.11-headers-6.11.0-26_6.11.0-26.26~24.04.1_all.deb \
+  https://launchpadlibrarian.net/788568280/linux-modules-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb \
+  https://launchpadlibrarian.net/788568281/linux-modules-extra-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb
+```
+
+Verify the downloads before installation:
+
+```bash
+(
+  cd "$kernel_dir"
+  sha256sum --check <<'EOF'
+5cde7652fc104f2a218dd519fbf336e005b0fd37537aff974a07e4e9a7c37b2d  linux-headers-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb
+10b29ad0097d17010c1fe5952f7eb663d1864274b498def4d2c49c323ef51f1c  linux-hwe-6.11-headers-6.11.0-26_6.11.0-26.26~24.04.1_all.deb
+9077e58bf542b2af12878ed102de97460aa66eea4130dd323384bfda9e33aecf  linux-image-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb
+8ddc0f247f1f9a5570d09899ded2fab7222b60ebe0c8967bd5a2220e9431ff5a  linux-modules-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb
+54aa1a4ab1af7ab140e41222af79721a48ca87ee03f22a27ad49087835e9e02d  linux-modules-extra-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb
+EOF
+)
+```
+
+All five files should report `OK`. Then install the local packages and their
+supporting packages:
 
 ```bash
 sudo apt update
 sudo apt install -y \
-  linux-image-6.11.0-26-generic \
-  linux-headers-6.11.0-26-generic \
-  linux-modules-6.11.0-26-generic \
-  linux-modules-extra-6.11.0-26-generic \
+  ./utils/kernel_6.11.0-26/*.deb \
   linux-firmware \
-  dkms build-essential
+  dkms \
+  build-essential
 ```
+
+The downloads include the image, modules, extra modules, generic headers, and
+the common HWE headers dependency. Package licensing and corresponding source
+links are documented in `utils/kernel_6.11.0-26/LICENSES.md`.
 
 To boot this kernel by default, set in `/etc/default/grub`:
 

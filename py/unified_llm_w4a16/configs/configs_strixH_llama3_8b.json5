@@ -6,7 +6,7 @@
     "usePackedWeights": true,
     "padPackedWeights": false,
     "usePreSavedWeights": true,
-    "prompt_len": 4096,
+    "prompt_len": 2048,
     "cpu_decode": false,
     "minimal_pdi": true,
     "gemv_driven_split_K": false,

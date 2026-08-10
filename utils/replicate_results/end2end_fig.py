@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -21,8 +20,6 @@ POPULATE_SCRIPT = REPO_ROOT / "py" / "heteroMosaic_figs" / "populate_data.py"
 GRAPH_SCRIPT = REPO_ROOT / "py" / "heteroMosaic_figs" / "graph_e2e_data.py"
 BUILD_RESULTS_DIR = REPO_ROOT / "build" / "results"
 FIGURES_DIR = BUILD_RESULTS_DIR / "fig"
-HETEROMOSAIC_STATE = REPO_ROOT / "build" / "benchmarks" / "heteroMosaic" / "benchmark.json"
-LLAMACPP_STATE = REPO_ROOT / "build" / "benchmarks" / "llama.cpp" / "benchmark.json"
 
 MACHINE_CONFIGS = {
     "350": {
@@ -72,6 +69,21 @@ MODEL_CONFIGS = {
     },
 }
 
+DEFAULT_MODELS = ("llama3_8b", "phi35_3.8b", "qwen14b")
+MODEL_ALIASES = {
+    "llama": "llama3_8b",
+    "llama3": "llama3_8b",
+    "llama3-8b": "llama3_8b",
+    "phi": "phi35_3.8b",
+    "phi3.5": "phi35_3.8b",
+    "phi3.5-3.8b": "phi35_3.8b",
+    "phi3.5_3.8b": "phi35_3.8b",
+    "qwen": "qwen14b",
+    "qwen14": "qwen14b",
+    "qwen2.5-14b": "qwen14b",
+    "qwen25_14b": "qwen14b",
+}
+
 
 def positive_int(value: str) -> int:
     try:
@@ -81,6 +93,18 @@ def positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("prompt sizes must be positive integers")
     return parsed
+
+
+def model_id(value: str) -> str:
+    requested = value.strip().lower()
+    selected = MODEL_ALIASES.get(requested, requested)
+    if selected not in MODEL_CONFIGS:
+        available = ", ".join(sorted(MODEL_CONFIGS))
+        raise argparse.ArgumentTypeError(
+            f"unsupported model '{value}'; available model ids: {available}; "
+            "short aliases: llama, phi, qwen"
+        )
+    return selected
 
 
 def parse_args() -> argparse.Namespace:
@@ -95,9 +119,13 @@ def parse_args() -> argparse.Namespace:
         "--model",
         dest="models",
         nargs="+",
-        choices=sorted(MODEL_CONFIGS),
-        default=["llama3_8b"],
-        help="Models to process (default: llama3_8b).",
+        type=model_id,
+        default=list(DEFAULT_MODELS),
+        metavar="MODEL",
+        help=(
+            f"Models to process (default: {' '.join(DEFAULT_MODELS)}). "
+            "Short aliases: llama, phi, qwen."
+        ),
     )
     parser.add_argument(
         "--machines",
@@ -197,14 +225,11 @@ def require_cached_inputs(paths: tuple[Path, Path]) -> None:
         )
 
 
-def snapshot_benchmark_state(source: Path, destination: Path) -> None:
-    if not source.is_file():
-        raise RuntimeError(f"Benchmark completed without writing its expected state: {source}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temp_destination = destination.with_suffix(destination.suffix + ".tmp")
-    shutil.copyfile(source, temp_destination)
-    os.replace(temp_destination, destination)
-    print(f"[cache] Saved machine/model benchmark snapshot: {destination}")
+def require_benchmark_state(label: str, state_path: Path) -> None:
+    if not state_path.is_file():
+        raise RuntimeError(
+            f"{label} completed without writing its model-specific state: {state_path}"
+        )
 
 
 def pipeline_paths(machine_id: str, model_id: str, model_config: dict) -> dict[str, Path]:
@@ -242,6 +267,8 @@ def build_pipeline_commands(
                 model_config["heteromosaic_model"],
                 "--prompt-sizes",
                 *size_args,
+                "--state-file",
+                str(paths["heteromosaic_state"]),
             ],
             HETEROMOSAIC_DIR,
             paths["heteromosaic_stdout"],
@@ -255,6 +282,8 @@ def build_pipeline_commands(
                 model_config["llamacpp_model"],
                 "--prompt-sizes",
                 *size_args,
+                "--state-file",
+                str(paths["llamacpp_state"]),
             ],
             LLAMACPP_DIR,
             paths["llamacpp_stdout"],
@@ -318,7 +347,7 @@ def main() -> int:
     if not machines:
         raise RuntimeError("Could not detect this machine; pass --machines 350, 370, or 395.")
 
-    if not args.skip_benchmarks:
+    if not args.skip_benchmarks and not args.dry_run:
         nonlocal_machines = [machine for machine in machines if machine != detected_machine]
         if nonlocal_machines:
             raise RuntimeError(
@@ -367,10 +396,12 @@ def main() -> int:
             if not args.skip_benchmarks:
                 for label, argv, cwd, output_path in benchmark_commands:
                     run_and_capture(label, argv, cwd, output_path)
-                    if label == "HeteroMosaic benchmark":
-                        snapshot_benchmark_state(HETEROMOSAIC_STATE, paths["heteromosaic_state"])
-                    elif label == "llama.cpp benchmark":
-                        snapshot_benchmark_state(LLAMACPP_STATE, paths["llamacpp_state"])
+                    state_path = (
+                        paths["heteromosaic_state"]
+                        if label == "HeteroMosaic benchmark"
+                        else paths["llamacpp_state"]
+                    )
+                    require_benchmark_state(label, state_path)
 
             for label, argv, cwd, output_path in processing_commands:
                 run_and_capture(label, argv, cwd, output_path)

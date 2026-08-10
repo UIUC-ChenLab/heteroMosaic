@@ -879,9 +879,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--state-file",
+        type=os.path.abspath,
+        default=STATE_FILE,
+        metavar="PATH",
+        help=f"Benchmark state JSON path (default: {STATE_FILE}).",
+    )
+    parser.add_argument(
         "--reset-state",
         action="store_true",
-        help=f"discard cached progress and start fresh (state file: {STATE_FILE})",
+        help="discard cached progress and start fresh in the selected state file",
     )
     parser.add_argument(
         "--clean-temp",
@@ -893,6 +900,9 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    STATE_FILE = args.state_file
+    BENCHMARK_DIR = os.path.dirname(STATE_FILE)
+    os.makedirs(BENCHMARK_DIR, exist_ok=True)
     selected_model_patterns = {
         model_name: MODEL_PATTERNS[model_name] for model_name in args.models
     }

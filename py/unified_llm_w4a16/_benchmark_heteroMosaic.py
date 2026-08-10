@@ -1176,6 +1176,13 @@ def parse_args() -> argparse.Namespace:
             f"(default: {' '.join(map(str, PROMPT_SIZES))})."
         ),
     )
+    parser.add_argument(
+        "--state-file",
+        type=os.path.abspath,
+        default=STATE_FILE,
+        metavar="PATH",
+        help=f"Benchmark state JSON path (default: {STATE_FILE}).",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Generate/merge cases and exit without running benchmarks.")
     parser.add_argument("--timeout-sec", type=int, default=DEFAULT_TIMEOUT_SEC, help="Per-case timeout in seconds.")
     parser.add_argument("--reset-state", action="store_true", help="Ignore existing benchmark.json and start a new state.")
@@ -1230,7 +1237,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    global BENCHMARK_DIR, LOG_FILE, STATE_FILE
+
     args = parse_args()
+    STATE_FILE = args.state_file
+    BENCHMARK_DIR = os.path.dirname(STATE_FILE)
+    os.makedirs(BENCHMARK_DIR, exist_ok=True)
+    LOG_FILE = os.path.join(
+        BENCHMARK_DIR,
+        f"benchmark_run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+    )
 
     if args.point_update and args.reset_state:
         print("Error: --point-update cannot be combined with --reset-state.")

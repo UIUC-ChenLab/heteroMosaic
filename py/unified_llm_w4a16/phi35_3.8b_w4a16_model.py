@@ -471,6 +471,13 @@ def _compute_effective_max_seq_len(
     return min(required, hard_cap)
 
 
+def _generation_capacity(max_new_tokens: int, generate: bool) -> int:
+    """Reserve the decode position used by the backend's M=1 warmup."""
+    if not generate:
+        return 0
+    return max(1, int(max_new_tokens))
+
+
 def _infer_prompt_token_count(tokenizer_path: str, text: str) -> int:
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     encoded = tokenizer(text, return_tensors="pt", padding=False, truncation=False)
@@ -972,15 +979,17 @@ def run_prompt_test(
         selected_prompt_len = _select_prompt_test_prompt_len(config_path, int(target_tokens))
         _set_prompt_len_in_config(config_path, selected_prompt_len)
 
+    generation_capacity = _generation_capacity(max_new_tokens, generate)
     effective_max_seq_len = _compute_effective_max_seq_len(
         max_seq_len,
         prompt_token_count=actual_token_count,
-        max_new_tokens=max_new_tokens if generate else 0,
+        max_new_tokens=generation_capacity,
     )
     if max_seq_len is None:
         print(
             f"Auto-selected backend max_seq_len={effective_max_seq_len} "
-            f"from prompt={actual_token_count} and max_new_tokens={max_new_tokens if generate else 0}"
+            f"from prompt={actual_token_count}, requested max_new_tokens={max_new_tokens if generate else 0}, "
+            f"and generation_capacity={generation_capacity}"
         )
 
     print(f"Initializing {DEFAULT_MODEL_LABEL} w4a16 quantized model...")
@@ -1503,10 +1512,11 @@ def main():
         prompt_token_count = _infer_prompt_token_count(resolved_tokenizer_path, args.text)
     except Exception as e:
         print(f"Warning: Could not infer prompt token count from tokenizer {resolved_tokenizer_path}: {e}")
+    generation_capacity = _generation_capacity(args.max_new_tokens, args.generate)
     effective_max_seq_len = _compute_effective_max_seq_len(
         args.max_seq_len,
         prompt_token_count=prompt_token_count,
-        max_new_tokens=args.max_new_tokens if args.generate else 0,
+        max_new_tokens=generation_capacity,
     )
     if args.max_seq_len is None:
         if prompt_token_count is None:
@@ -1514,7 +1524,9 @@ def main():
         else:
             print(
                 f"Auto-selected backend max_seq_len={effective_max_seq_len} "
-                f"from prompt={prompt_token_count} and max_new_tokens={args.max_new_tokens if args.generate else 0}"
+                f"from prompt={prompt_token_count}, "
+                f"requested max_new_tokens={args.max_new_tokens if args.generate else 0}, "
+                f"and generation_capacity={generation_capacity}"
             )
 
     print("=" * 60)

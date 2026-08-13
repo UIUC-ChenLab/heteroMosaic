@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 PROMPT_SIZES = [1024, 2048, 4096, 8192, 16384]
 # PROMPT_SIZES = [256, 512, 1024, 2048, 4096, 8192]
 MICRO_BATCH_SIZE = -2
-DEFAULT_TIMEOUT_SEC = 300
+DEFAULT_TIMEOUT_SEC = 500
 WARMUP = True
 DUMMY_WEIGHTS = True
 RUN_GEN = True
@@ -25,10 +25,10 @@ DO_NOT_SEARCH_MP = True
 # Default model target for benchmarks.
 # Available values:
 # MODEL = "gemma"
-MODEL = "llama3_8b"
+# MODEL = "llama3_8b"
 # MODEL = "llama3_70b"
 # MODEL = "phi3.5_3.8b"
-# MODEL = "qwen14b"
+MODEL = "qwen14b"
 # MODEL = "qwen3b"
 
 SYSTEM_PROFILE_TOKEN_MAP = [

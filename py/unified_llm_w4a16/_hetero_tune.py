@@ -23,8 +23,8 @@ PROMPT_SIZES = [512, 1024, 2048, 4096, 8192, 16384]
 # MODEL = "gemma"
 # MODEL = "llama3_8b"
 # MODEL = "llama3_70b"
-# MODEL = "phi3.5_3.8b"
-MODEL = "qwen14b"
+MODEL = "phi3.5_3.8b"
+# MODEL = "qwen14b"
 
 # Verbosity level for benchmarks (0=silent, 1=setup messages, 2=runtime messages)
 VERBOSITY = 1
@@ -243,7 +243,7 @@ models_config = [
             {"name": "o",    "K": 3072, "N": 3072, "gemm_split": "M", "gemv_split": "K", "gemv_disable_npu_tuning": False},
             {"name": "up",   "K": 3072, "N": 8192, "gemm_split": "M", "gemv_split": "K", "gemv_disable_npu_tuning": False},
             {"name": "gate", "K": 3072, "N": 8192, "gemm_split": "M", "gemv_split": "K", "gemv_disable_npu_tuning": False},
-            {"name": "down", "K": 8192, "N": 3072, "gemm_split": "K", "gemv_split": "K", "gemv_disable_npu_tuning": False}
+            {"name": "down", "K": 8192, "N": 3072, "gemm_split": "M", "gemv_split": "K", "gemv_disable_npu_tuning": False}
         ]
     }
 ]

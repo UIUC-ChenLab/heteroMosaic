@@ -737,7 +737,7 @@ def main(model_patterns, prompt_sizes, reset_state=False, clean_temp=False):
                             proc.kill()
                         break
 
-                    if time.time() - start_time > 180:
+                    if time.time() - start_time > 500:
                         print("Timeout reached, killing process.")
                         proc.kill()
                         break

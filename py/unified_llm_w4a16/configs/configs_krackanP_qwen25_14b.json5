@@ -2,7 +2,7 @@
     "heterogeneity": "gpu",
     "warmup": false,
     "dummy_weights": false,
-    "debug_verbosity": 2,
+    "debug_verbosity": 1,
     "usePackedWeights": true,
     "padPackedWeights": false,
     "usePreSavedWeights": true,

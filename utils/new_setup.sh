@@ -31,8 +31,8 @@ python3 -m pip install pybind11
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "Installing requirements for ROCm 7.2..."
-python3 -m pip install -r "$SCRIPT_DIR/requirements_rocm7.2.txt"
+echo "Installing requirements for ROCm 7.1.1..."
+python3 -m pip install -r "$SCRIPT_DIR/requirements_rocm7.1.txt"
 pip install timm torchsummary transformers
 pip install sentencepiece
 pip install matplotlib

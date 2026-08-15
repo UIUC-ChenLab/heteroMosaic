@@ -291,7 +291,7 @@ class UnifiedLLMW4A16Impl : public torch::nn::Module {
     torch::Tensor attn_output_proj_buffer;
     torch::Tensor norm_buffer;
     std::vector<LlamaPipelineScratchSpace> llama_pipeline_scratch_slots;
-    std::vector<c10::cuda::CUDAStream> llama_chunk_slot_streams_;
+    std::vector<c10::hip::HIPStream> llama_chunk_slot_streams_;
     std::vector<std::vector<hipEvent_t>> llama_chunk_kv_ready_events_;
     bool llama_chunk_async_runtime_ready_ = false;
     c10::DeviceIndex llama_chunk_async_device_index_ = static_cast<c10::DeviceIndex>(-1);

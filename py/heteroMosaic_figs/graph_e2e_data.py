@@ -17,6 +17,13 @@ except ModuleNotFoundError as exc:
 
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BUILD_RESULTS_DIR = REPO_ROOT / "build" / "results"
+PLATFORM_NAME_MAP = {
+    "350": "Ryzen AI 7 350",
+    "370": "Ryzen AI 9 HX 370",
+    "395": "Ryzen AI MAX+ 395",
+}
 
 # Default model target for plotting.
 # Available values:
@@ -27,6 +34,7 @@ MODEL = "llama3_8b"
 # MODEL = "llama3_8b"
 
 MODEL_CONFIGS = {
+    "gemma": {"json_path": RESULTS_DIR / "gemma_results.json"},
     "llama3_8b": {"json_path": RESULTS_DIR / "llama3-8b_results.json"},
     "llama3_70b": {"json_path": RESULTS_DIR / "llama3-70b_results.json"},
     "qwen14b": {"json_path": RESULTS_DIR / "qwen14b_results.json"},
@@ -109,6 +117,18 @@ def parse_args() -> argparse.Namespace:
         "--platform",
         default=None,
         help="Platform key to plot; defaults to the first top-level key in the JSON file",
+    )
+    parser.add_argument(
+        "--machine",
+        choices=sorted(PLATFORM_NAME_MAP),
+        default=None,
+        help="Machine id to plot (350, 370, or 395).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for generated PNG/PDF files; machine-scoped build results are used by default when detected.",
     )
     return parser.parse_args()
 
@@ -567,6 +587,8 @@ def plot_prefill_latency(
     rng = random.Random(f"{ERROR_BAR_SEED}:{json_path.stem}:prefill")
     legend_series: list[list[tuple[float, float]]] = []
     plotted_count = 0
+    x_positions = list(range(len(prompt_sizes)))
+    x_lookup = {size: idx for idx, size in enumerate(prompt_sizes)}
 
     ordered_labels = ["llama.cpp", "iGPU", "npu", "HeteroInfer", "HeteroMosaic"]
     for platform_name in selected_platforms:
@@ -576,12 +598,13 @@ def plot_prefill_latency(
             points = series.get(label)
             if not points:
                 continue
-            xs = [size for size, _ in points]
+            prompt_xs = [size for size, _ in points]
+            xs = [x_lookup[size] for size in prompt_xs]
             ys = [value for _, value in points]
             legend_series.append(list(zip(xs, ys)))
             plotted_count += 1
             style = STYLE_MAP[label]
-            yerr = build_random_error_bars(rng, platform_name, xs, ys)
+            yerr = build_random_error_bars(rng, platform_name, prompt_xs, ys)
             plt.errorbar(
                 xs,
                 ys,
@@ -595,8 +618,12 @@ def plot_prefill_latency(
                 capsize=3,
             )
 
-    plt.title("Prefill Latency vs Prompt Length\n350 / 370 / 395")
-    plt.xticks(prompt_sizes)
+    platform_labels = " / ".join(
+        get_platform_style(platform_name)["platform_label"]
+        for platform_name in selected_platforms
+    )
+    plt.title(f"Prefill Latency vs Prompt Length\n{platform_labels}")
+    plt.xticks(x_positions, [str(size) for size in prompt_sizes])
     style_axes("Prompt Length (tokens)", "Prefill / TTFT (seconds)")
     plt.grid(True, linestyle="--", alpha=0.3)
     legend_style_kwargs = {"frameon": True, "fancybox": False, "edgecolor": "black", "ncol": 3}
@@ -701,6 +728,7 @@ def plot_speedup_vs_igpu(
 def plot_json_file(
     json_path: Path,
     selected_platform: str | None,
+    requested_plot_dir: Path | None = None,
 ) -> dict[str, dict[str, list[SpeedupRecord]]]:
     if not json_path.exists():
         raise SystemExit(f"JSON file does not exist: {json_path}")
@@ -725,16 +753,23 @@ def plot_json_file(
         raise SystemExit("No prompt sizes found in the selected platform data")
 
     setup_style()
-    plot_dir = json_path.parent.parent / "plots"
+    if requested_plot_dir is not None:
+        plot_dir = requested_plot_dir.resolve()
+    elif json_path.parent.parent.resolve() == BUILD_RESULTS_DIR.resolve():
+        plot_dir = BUILD_RESULTS_DIR / "fig" / json_path.parent.name
+    else:
+        plot_dir = json_path.parent.parent / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    plot_prefill_latency(json_path, selected_platforms, prompt_sizes, platform_series, plot_dir)
     plot_speedup_vs_igpu(json_path, selected_platforms, prompt_sizes, platform_series, plot_dir)
     return collect_heteromosaic_speedups(json_path.stem, platform_series)
 
 
 def main() -> int:
     args = parse_args()
+    if args.machine and args.platform:
+        raise SystemExit("Use either --machine or --platform, not both.")
+    selected_platform = PLATFORM_NAME_MAP[args.machine] if args.machine else args.platform
 
     if args.json_path is not None:
         json_paths = [args.json_path.resolve()]
@@ -746,7 +781,7 @@ def main() -> int:
     aggregated_speedups: dict[str, dict[str, list[SpeedupRecord]]] = {}
     for json_path in json_paths:
         print(f"Generating plots for {json_path}")
-        json_speedups = plot_json_file(json_path, args.platform)
+        json_speedups = plot_json_file(json_path, selected_platform, args.output_dir)
         for platform_name, platform_speedups in json_speedups.items():
             aggregated_platform = aggregated_speedups.setdefault(platform_name, {})
             for comparison_label, values in platform_speedups.items():

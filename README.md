@@ -6,9 +6,9 @@ This guide describes how to replicate the `libraries` directory in a directory o
 
 ## Prerequisites
 
-### 1. ROCm 7.2
-Ensure ROCm 7.2 is installed on your system.
-Reference: [ROCm Quick Start Guide](https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.2.0/install/quick-start.html)
+### 1. ROCm 7.1.1
+Ensure ROCm 7.1.1 is installed at `/opt/rocm-7.1.1`.
+Reference: [ROCm Quick Start Guide](https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.1.1/install/quick-start.html)
 
 ### 2. AOCL (AMD Optimizing CPU Libraries)
 Instructions and downloads can be found here:
@@ -19,18 +19,55 @@ Instructions and downloads can be found here:
 
 Install the recommended kernel and configure GRUB for large GTT (Graphics Translation Table) memory. Do this **before** running the library setup steps below.
 
-**Install kernel 6.11.0-26-generic (e.g. Ubuntu 24.04):**
+**Install kernel 6.11.0-26-generic (Ubuntu 24.04.4, amd64):**
+
+The required `6.11.0-26.26~24.04.1` packages are no longer available through
+the current Ubuntu package index. Download the unmodified packages directly
+from Canonical's Launchpad archive into `utils/kernel_6.11.0-26`:
+
+```bash
+cd /path/to/heteroMosaic
+kernel_dir="utils/kernel_6.11.0-26"
+mkdir -p "$kernel_dir"
+
+wget --continue --https-only --directory-prefix="$kernel_dir" \
+  https://launchpadlibrarian.net/789269712/linux-image-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb \
+  https://launchpadlibrarian.net/788568255/linux-headers-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb \
+  https://launchpadlibrarian.net/788568258/linux-hwe-6.11-headers-6.11.0-26_6.11.0-26.26~24.04.1_all.deb \
+  https://launchpadlibrarian.net/788568280/linux-modules-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb \
+  https://launchpadlibrarian.net/788568281/linux-modules-extra-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb
+```
+
+Verify the downloads before installation:
+
+```bash
+(
+  cd "$kernel_dir"
+  sha256sum --check <<'EOF'
+5cde7652fc104f2a218dd519fbf336e005b0fd37537aff974a07e4e9a7c37b2d  linux-headers-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb
+10b29ad0097d17010c1fe5952f7eb663d1864274b498def4d2c49c323ef51f1c  linux-hwe-6.11-headers-6.11.0-26_6.11.0-26.26~24.04.1_all.deb
+9077e58bf542b2af12878ed102de97460aa66eea4130dd323384bfda9e33aecf  linux-image-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb
+8ddc0f247f1f9a5570d09899ded2fab7222b60ebe0c8967bd5a2220e9431ff5a  linux-modules-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb
+54aa1a4ab1af7ab140e41222af79721a48ca87ee03f22a27ad49087835e9e02d  linux-modules-extra-6.11.0-26-generic_6.11.0-26.26~24.04.1_amd64.deb
+EOF
+)
+```
+
+All five files should report `OK`. Then install the local packages and their
+supporting packages:
 
 ```bash
 sudo apt update
 sudo apt install -y \
-  linux-image-6.11.0-26-generic \
-  linux-headers-6.11.0-26-generic \
-  linux-modules-6.11.0-26-generic \
-  linux-modules-extra-6.11.0-26-generic \
+  ./utils/kernel_6.11.0-26/*.deb \
   linux-firmware \
-  dkms build-essential
+  dkms \
+  build-essential
 ```
+
+The downloads include the image, modules, extra modules, generic headers, and
+the common HWE headers dependency. Package licensing and corresponding source
+links are documented in `utils/kernel_6.11.0-26/LICENSES.md`.
 
 To boot this kernel by default, set in `/etc/default/grub`:
 
@@ -82,21 +119,21 @@ source ~/.bashrc
 
 ### 1. Setup LibTorch
 
-`heteroMosaic` first tries to discover PyTorch from the active Python environment. If that is unavailable, it falls back to `${HOME_LIBS}/libtorch_7.2`.
+`heteroMosaic` first tries to discover PyTorch from the active Python environment. If that is unavailable, it falls back to `${HOME_LIBS}/libtorch_7.1.0`.
 
 ```bash
 mkdir -p "$HOME_LIBS"
 cd "$HOME_LIBS"
-wget https://download.pytorch.org/libtorch/rocm7.2/libtorch-shared-with-deps-2.11.0%2Brocm7.2.zip
-unzip libtorch-shared-with-deps-2.11.0+rocm7.2.zip
-mv libtorch libtorch_7.2
-rm libtorch-shared-with-deps-2.11.0+rocm7.2.zip
+wget https://download.pytorch.org/libtorch/rocm7.1/libtorch-shared-with-deps-2.10.0%2Brocm7.1.zip
+unzip libtorch-shared-with-deps-2.10.0+rocm7.1.zip
+mv libtorch libtorch_7.1.0
+rm libtorch-shared-with-deps-2.10.0+rocm7.1.zip
 ```
 
 After extraction, the expected layout is:
 
 ```bash
-$HOME_LIBS/libtorch_7.2/
+$HOME_LIBS/libtorch_7.1.0/
   bin/
   include/
   lib/
@@ -157,8 +194,8 @@ source new_setup.sh
 ```
 This script:
 - creates a fresh `utils/rocmPytorch` virtual environment
-- installs ROCm 7.2 Python packages from `requirements_rocm7.2.txt`
-- installs the rest of the Python dependencies from `requirements.txt`
+- installs ROCm 7.1 Python packages from `requirements_rocm7.1.txt`, matching the ROCm 7.1.1 system installation
+- installs the remaining model and benchmark dependencies used by the project
 
 > [!IMPORTANT]
 > This script will fail if ROCm is not correctly set up.
@@ -174,7 +211,7 @@ In the new terminal, navigate to the project root and follow these steps:
    ```
    This script activates the virtual environment and exports the main runtime variables used by the build:
    - `HETEROMOSAIC_ROOT`
-   - `ROCM_PATH` pointing at your ROCm installation, typically `/opt/rocm`
+   - `ROCM_PATH=/opt/rocm-7.1.1`
    - `HSA_OVERRIDE_GFX_VERSION=11.0.0` on non-`AMD RYZEN AI MAX+ 395 w/ Radeon 8060S` systems
 
 2. **Run CMake and Build**:

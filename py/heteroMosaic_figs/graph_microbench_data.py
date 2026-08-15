@@ -112,6 +112,11 @@ def parse_args() -> argparse.Namespace:
         help="Print normalized datapoints for each shape.",
     )
     parser.add_argument(
+        "--aggregate-only",
+        action="store_true",
+        help="Only write the aggregate speedup and GOPS plots.",
+    )
+    parser.add_argument(
         "--aspect-ratio",
         type=float,
         default=DEFAULT_ASPECT_RATIO,
@@ -289,7 +294,8 @@ def generate_plots(
     json_path = (json_path_override or default_json_path(device_id, split_dim)).resolve()
     fig_dir = (fig_dir_override or default_fig_dir(device_id, split_dim)).resolve()
     fig_dir.mkdir(parents=True, exist_ok=True)
-    ALL_PLATFORMS_FIG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    if fig_dir_override is None:
+        ALL_PLATFORMS_FIG_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
     data = load_results(json_path)
     grouped = build_shape_entries(data["results"], split_dim)
@@ -362,6 +368,9 @@ def generate_plots(
                 print(f"  {fraction:.4f}, {speedup:.6f}")
             print()
 
+        if args.aggregate_only:
+            continue
+
         speedup_fig = plt.figure(figsize=figure_size(args.aspect_ratio))
         speedup_ax = speedup_fig.add_subplot()
         speedup_ax.errorbar(avg_speedup_dict.keys(), avg_speedup_dict.values(), yerr=yerr_speedup, marker="o")
@@ -399,7 +408,8 @@ def generate_plots(
         total_speedup_ax.legend()
     total_speedup_fig.tight_layout()
     save_figure(total_speedup_fig, fig_dir / "speedup_over_igpu_plot")
-    save_figure(total_speedup_fig, all_platforms_speedup_stem(device_id, split_dim))
+    if fig_dir_override is None:
+        save_figure(total_speedup_fig, all_platforms_speedup_stem(device_id, split_dim))
     plt.close(total_speedup_fig)
 
     total_gops_ax.set_ylabel("Measured GOPS")
@@ -422,7 +432,9 @@ def main() -> None:
     args = parse_args()
     setup_style()
 
-    if GENERATE_ALL_PLOTS:
+    # Explicit input/output paths select one dataset. With no path overrides,
+    # retain the historical GENERATE_ALL_PLOTS behavior.
+    if GENERATE_ALL_PLOTS and args.json is None and args.fig_dir is None:
         for device_id in DEVICE_RUN_ORDER:
             for split_dim in SPLIT_DIM_RUN_ORDER:
                 generate_plots(args, device_id, split_dim)

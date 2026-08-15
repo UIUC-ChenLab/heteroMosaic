@@ -19,3 +19,6 @@ __pycache__/
 **/__pycache__/
 *.pyc
 .cache/
+
+# Locally downloaded Ubuntu kernel packages
+/utils/kernel_6.11.0-26/*.deb

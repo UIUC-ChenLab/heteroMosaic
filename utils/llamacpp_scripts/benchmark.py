@@ -1,3 +1,6 @@
+import argparse
+import datetime
+import json
 import os
 import subprocess
 import glob
@@ -11,10 +14,14 @@ import sys
 
 # Configuration
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROMPTS_FILE = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "py", "prompts.txt"))
-# PROMPT_SIZES = [1024, 2048, 4096, 8192, 16384]
-PROMPT_SIZES = [256, 512, 1024, 2048, 4096, 8192]
-# PROMPT_SIZES = [4096]
+REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, "..", ".."))
+BENCHMARK_DIR = os.path.join(REPO_ROOT, "build", "benchmarks", "llama.cpp")
+os.makedirs(BENCHMARK_DIR, exist_ok=True)
+STATE_FILE = os.path.join(BENCHMARK_DIR, "benchmark.json")
+PROMPTS_FILE = "../../py/prompts.txt"
+PROJECT_BUILD_DIR = "../../build"
+MODELS_DIR = f"{PROJECT_BUILD_DIR}/models"
+DEFAULT_PROMPT_SIZES = [256, 512, 1024, 2048, 4096, 8196, 16384]
 COOLDOWN_SEC = 16
 # MICRO_BATCH_SIZE behavior:
 #   > 0 : use the value directly
@@ -22,73 +29,85 @@ COOLDOWN_SEC = 16
 #   else: use full prompt tokens
 MICRO_BATCH_SIZE = -2
 MODEL_PATTERNS = {
-    "llama3-8b": "*llama3-8b*q4_k_s.gguf",
-    # "llama3-8b-q8_0": "*llama3-8b*q8_0.gguf",
-    # "phi3.5-3.8b": "*phi-3.5-mini-instruct*q4_k_s.gguf",
-    # "qwen3b": "*qwen2.5-3b*q4_k_s.gguf",
-    # "qwen2.5-3b-q8_0": "*qwen2.5-3b*q8_0.gguf",
-    # "qwen2.5-1.5b": "*qwen2.5-1.5b*q4_k_s.gguf",
-    # "qwen2.5-14b": "*qwen2.5-14b*q4_k_s.gguf",
-    # "qwen2.5-1.5b-q8_0": "*qwen2.5-1.5b*q8_0.gguf",
-    # "qwen2.5-14b-q8_0": "*qwen2.5-14b*q8_0.gguf",
-    # "gemma1-2b": "*gemma-2b*q4_k_s.gguf",
-    # "gemma1-2b-q8_0": "*gemma-2b-it*q8_0.gguf",
-    # "llama3-70b": "*llama3-70b*q4_k_s.gguf",
-    # "mixtral-8x7b": "*mixtral-8x7b*Q4_K_M.gguf",
+    "llama3-8b_q4_k_s": "*llama3-8b*q4_k_s.gguf",
+    "llama3-8b-q8_0": "*llama3-8b*q8_0.gguf",
+    "phi3.5-3.8b_q4_k_s": "*phi-3.5-mini-instruct*q4_k_s.gguf",
+    "qwen3b_q4_k_s": "*qwen2.5-3b*q4_k_s.gguf",
+    "qwen2.5-3b-q8_0": "*qwen2.5-3b*q8_0.gguf",
+    "qwen2.5-1.5b_q4_k_s": "*qwen2.5-1.5b*q4_k_s.gguf",
+    "qwen2.5-14b_q4_k_s": "*qwen2.5-14b*q4_k_s.gguf",
+    "qwen2.5-1.5b-q8_0": "*qwen2.5-1.5b*q8_0.gguf",
+    "qwen2.5-14b-q8_0": "*qwen2.5-14b*q8_0.gguf",
+    "gemma1-2b_q4_k_s": "*gemma-2b*q4_k_s.gguf",
+    "gemma1-2b_q8_0": "*gemma-2b-it*q8_0.gguf",
+    "llama3-70b_q4_k_s": "*llama3-70b*q4_k_s.gguf",
+    "mixtral-8x7b_Q4_K_M": "*mixtral-8x7b*Q4_K_M.gguf",
+}
+DEFAULT_MODELS = ["llama3-8b-q8_0"]
+
+MODEL_NAME_ALIASES = {
+    "llama3-8b": "llama3-8b_q4_k_s",
+    "phi3.5-3.8b": "phi3.5-3.8b_q4_k_s",
+    "qwen3b": "qwen3b_q4_k_s",
+    "qwen2.5-1.5b": "qwen2.5-1.5b_q4_k_s",
+    "qwen2.5-14b": "qwen2.5-14b_q4_k_s",
+    "gemma1-2b": "gemma1-2b_q4_k_s",
+    "gemma1-2b-q8_0": "gemma1-2b_q8_0",
+    "llama3-70b": "llama3-70b_q4_k_s",
+    "mixtral-8x7b": "mixtral-8x7b_Q4_K_M",
 }
 
 # Map model names to specific filenames to ensure patterns match after download
 MODEL_FILENAMES = {
-    "llama3-8b": "llama3-8b-instruct-q4_k_s.gguf",
+    "llama3-8b_q4_k_s": "llama3-8b-instruct-q4_k_s.gguf",
     "llama3-8b-q8_0": "llama3-8b-instruct-q8_0.gguf",
-    "llama3-70b": "llama3-70b-instruct-q4_k_s.gguf",
-    "phi3.5-3.8b": "phi-3.5-mini-instruct-q4_k_s.gguf",
-    "qwen3b": "qwen2.5-3b-instruct-q4_k_s.gguf",
+    "llama3-70b_q4_k_s": "llama3-70b-instruct-q4_k_s.gguf",
+    "phi3.5-3.8b_q4_k_s": "phi-3.5-mini-instruct-q4_k_s.gguf",
+    "qwen3b_q4_k_s": "qwen2.5-3b-instruct-q4_k_s.gguf",
     "qwen2.5-3b-q8_0": "qwen2.5-3b-instruct-q8_0.gguf",
-    "qwen2.5-1.5b": "qwen2.5-1.5b-instruct-q4_k_s.gguf",
-    "qwen2.5-14b": "qwen2.5-14b-instruct-q4_k_s.gguf",
+    "qwen2.5-1.5b_q4_k_s": "qwen2.5-1.5b-instruct-q4_k_s.gguf",
+    "qwen2.5-14b_q4_k_s": "qwen2.5-14b-instruct-q4_k_s.gguf",
     "qwen2.5-1.5b-q8_0": "qwen2.5-1.5b-instruct-q8_0.gguf",
     "qwen2.5-14b-q8_0": "qwen2.5-14b-instruct-q8_0.gguf",
-    "gemma1-2b": "gemma-2b-it-q4_k_s.gguf",
-    "gemma1-2b-q8_0": "gemma-2b-it-q8_0.gguf",
-    "mixtral-8x7b": "mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf",
+    "gemma1-2b_q4_k_s": "gemma-2b-it-q4_k_s.gguf",
+    "gemma1-2b_q8_0": "gemma-2b-it-q8_0.gguf",
+    "mixtral-8x7b_Q4_K_M": "mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf",
 }
 
 # Hugging Face fallback URLs (using Bartowski/Qwen optimized GGUFs)
 MODEL_URLS = {
-    "llama3-8b": "https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_K_S.gguf",
+    "llama3-8b_q4_k_s": "https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_K_S.gguf",
     "llama3-8b-q8_0": "https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q8_0.gguf",
-    "llama3-70b": "https://huggingface.co/bartowski/Meta-Llama-3-70B-Instruct-GGUF/resolve/main/Meta-Llama-3-70B-Instruct-Q4_K_S.gguf", 
-    "phi3.5-3.8b": "https://huggingface.co/bartowski/Phi-3.5-mini-instruct-GGUF/resolve/main/Phi-3.5-mini-instruct-Q4_K_S.gguf",
-    "qwen3b": "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_S.gguf",
+    "llama3-70b_q4_k_s": "https://huggingface.co/bartowski/Meta-Llama-3-70B-Instruct-GGUF/resolve/main/Meta-Llama-3-70B-Instruct-Q4_K_S.gguf",
+    "phi3.5-3.8b_q4_k_s": "https://huggingface.co/bartowski/Phi-3.5-mini-instruct-GGUF/resolve/main/Phi-3.5-mini-instruct-Q4_K_S.gguf",
+    "qwen3b_q4_k_s": "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_S.gguf",
     "qwen2.5-3b-q8_0": "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q8_0.gguf",
-    "qwen2.5-1.5b": "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_S.gguf",
-    "qwen2.5-14b": "https://huggingface.co/bartowski/Qwen2.5-14B-Instruct-GGUF/resolve/main/Qwen2.5-14B-Instruct-Q4_K_S.gguf",
+    "qwen2.5-1.5b_q4_k_s": "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_S.gguf",
+    "qwen2.5-14b_q4_k_s": "https://huggingface.co/bartowski/Qwen2.5-14B-Instruct-GGUF/resolve/main/Qwen2.5-14B-Instruct-Q4_K_S.gguf",
     "qwen2.5-1.5b-q8_0": "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q8_0.gguf",
     "qwen2.5-14b-q8_0": "https://huggingface.co/bartowski/Qwen2.5-14B-Instruct-GGUF/resolve/main/Qwen2.5-14B-Instruct-Q8_0.gguf",
-    "gemma1-2b": "https://huggingface.co/mlabonne/gemma-2b-it-GGUF/resolve/main/gemma-2b-it.Q4_K_S.gguf",
-    "gemma1-2b-q8_0": "https://huggingface.co/mlabonne/gemma-2b-it-GGUF/resolve/main/gemma-2b-it.Q8_0.gguf",
+    "gemma1-2b_q4_k_s": "https://huggingface.co/mlabonne/gemma-2b-it-GGUF/resolve/main/gemma-2b-it.Q4_K_S.gguf",
+    "gemma1-2b_q8_0": "https://huggingface.co/mlabonne/gemma-2b-it-GGUF/resolve/main/gemma-2b-it.Q8_0.gguf",
 }
 
 # Original weights configuration for fallback
 ORIGINAL_MODEL_REPOS = {
-    "mixtral-8x7b": "mistralai/Mixtral-8x7B-Instruct-v0.1"
+    "mixtral-8x7b_Q4_K_M": "mistralai/Mixtral-8x7B-Instruct-v0.1"
 }
 
-# Search paths for models
-SEARCH_PATHS = [
-    ".",
-    "models"
-]
+# Search path for models
+SEARCH_PATHS = [MODELS_DIR]
 
 # Binary path configuration
 # Set USE_OLD_BUILD = True to use the old llama.cpp version (after running setup_old.sh)
 USE_OLD_BUILD = False
+LLAMA_DIR = f"{PROJECT_BUILD_DIR}/llama.cpp"
+LLAMA_BUILD_DIR = f"{LLAMA_DIR}/build"
 
 if USE_OLD_BUILD:
     LLAMA_BIN = "./llama.cpp.old/build/bin/llama-completion"
 else:
-    LLAMA_BIN = "./llama.cpp/build/bin/llama-completion"
+    LLAMA_BIN = f"{LLAMA_BUILD_DIR}/bin/llama-completion"
 
 def get_hsa_target():
     """Detect appropriate HSA_OVERRIDE_GFX_VERSION based on rocminfo.
@@ -114,13 +133,15 @@ HSA_TARGET_VERSION = get_hsa_target()
 def download_and_convert_model(model_name):
     print(f"Attempting to download and convert {model_name}...")
     
-    if model_name != "mixtral-8x7b":
+    if model_name != "mixtral-8x7b_Q4_K_M":
         print("Fallback conversion only implemented for Mixtral-8x7b")
         return False
         
     print("Downloading original weights using hf-cli...")
-    repo_id = "mistralai/Mixtral-8x7B-Instruct-v0.1" 
-    raw_model_dir = "models/raw/Mixtral-8x7B-Instruct-v0.1"
+    repo_id = ORIGINAL_MODEL_REPOS[model_name]
+    raw_model_dir = os.path.join(
+        MODELS_DIR, "raw", "Mixtral-8x7B-Instruct-v0.1"
+    )
     
     try:
         subprocess.run([
@@ -132,12 +153,14 @@ def download_and_convert_model(model_name):
         return False
         
     print("Converting to GGUF (f16)...")
-    convert_script = "llama.cpp/convert_hf_to_gguf.py"
+    convert_script = f"{LLAMA_DIR}/convert_hf_to_gguf.py"
     if not os.path.exists(convert_script):
         print(f"Convert script not found at {convert_script}")
         return False
         
-    outfile_f16 = "models/mixtral-8x7b-instruct-v0.1.fp16.gguf"
+    outfile_f16 = os.path.join(
+        MODELS_DIR, "mixtral-8x7b-instruct-v0.1.fp16.gguf"
+    )
     try:
         subprocess.run([
             sys.executable, convert_script, raw_model_dir,
@@ -149,8 +172,10 @@ def download_and_convert_model(model_name):
         return False
         
     print("Quantizing to Q4_K_M...")
-    quantize_bin = "llama.cpp/build/bin/llama-quantize"
-    outfile_q4 = "models/mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf"
+    quantize_bin = f"{LLAMA_BUILD_DIR}/bin/llama-quantize"
+    outfile_q4 = os.path.join(
+        MODELS_DIR, "mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf"
+    )
     
     if not os.path.exists(quantize_bin):
         print(f"Quantize binary not found at {quantize_bin}")
@@ -175,7 +200,7 @@ def download_model(model_name, url):
         print(f"No download URL known for {model_name}")
         return None
     
-    output_dir = "models"
+    output_dir = MODELS_DIR
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         
@@ -295,7 +320,7 @@ def calibrate_token_count(model_path, prompt_text, target_tokens):
     
     return best_prompt, best_tokens
 
-def run_calibration_test(model_path):
+def run_calibration_test(model_path, prompt_sizes):
     """Run a quick test to measure actual vs estimated tokens"""
     print("\n=== Token Calibration Test ===")
     
@@ -305,7 +330,7 @@ def run_calibration_test(model_path):
         return {}
     
     results = {}
-    for target in PROMPT_SIZES:
+    for target in prompt_sizes:
         prompt = get_prompt_text(target)
         
         # Write temp file
@@ -366,15 +391,181 @@ def parse_results(output):
         
     return metrics if metrics else None
 
-def main():
+
+def iso_now():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def canonical_model_name(model_name):
+    return MODEL_NAME_ALIASES.get(model_name, model_name)
+
+
+def case_key(model_name, prompt_size):
+    return f"{canonical_model_name(model_name)}|{int(prompt_size)}"
+
+
+def save_json_atomic(path, payload):
+    """Write state without leaving a partially written JSON file after a crash."""
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as state_file:
+        json.dump(payload, state_file, indent=2)
+        state_file.write("\n")
+        state_file.flush()
+        os.fsync(state_file.fileno())
+    os.replace(temp_path, path)
+
+
+def load_benchmark_state(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as state_file:
+        state = json.load(state_file)
+    if not isinstance(state, dict) or not isinstance(state.get("cases"), list):
+        raise ValueError("state file does not contain a valid cases list")
+    return state
+
+
+def cleanup_temp_artifacts():
+    targets = {STATE_FILE, STATE_FILE + ".tmp"}
+    for directory in {SCRIPT_DIR, os.getcwd()}:
+        targets.update(glob.glob(os.path.join(directory, "temp_prompt_*.txt")))
+
+    removed = []
+    for path in sorted(targets):
+        if not os.path.isfile(path):
+            continue
+        os.remove(path)
+        removed.append(path)
+    return removed
+
+
+def build_initial_state(model_patterns, prompt_sizes):
+    now = iso_now()
+    cases = []
+    for model_name in model_patterns:
+        for prompt_size in prompt_sizes:
+            cases.append({
+                "key": case_key(model_name, prompt_size),
+                "model": model_name,
+                "prompt_size": int(prompt_size),
+                "status": "pending",
+                "attempts": 0,
+                "last_start": None,
+                "last_end": None,
+                "model_path": None,
+                "command": None,
+                "error": None,
+                "result": None,
+            })
+    return {
+        "version": 1,
+        "created_at": now,
+        "updated_at": now,
+        "models": list(model_patterns),
+        "prompt_sizes": [int(size) for size in prompt_sizes],
+        "micro_batch_size": int(MICRO_BATCH_SIZE),
+        "cases": cases,
+    }
+
+
+def merge_benchmark_state(existing, fresh):
+    """Reuse completed cases and make interrupted cases eligible for retry."""
+    if not isinstance(existing, dict):
+        return fresh, 0
+
+    old_cases = existing.get("cases", [])
+    old_by_key = {}
+    for case in old_cases:
+        if not isinstance(case, dict):
+            continue
+        try:
+            migrated_key = case_key(case.get("model"), case.get("prompt_size"))
+        except (TypeError, ValueError):
+            continue
+        old_by_key[migrated_key] = case
+    recovered = 0
+    preserved_fields = (
+        "status",
+        "attempts",
+        "last_start",
+        "last_end",
+        "model_path",
+        "command",
+        "error",
+        "result",
+    )
+
+    for case in fresh["cases"]:
+        old_case = old_by_key.get(case["key"])
+        if not old_case:
+            continue
+        for field in preserved_fields:
+            if field in old_case:
+                case[field] = old_case[field]
+        if case.get("status") == "running":
+            case["status"] = "pending"
+            case["last_end"] = iso_now()
+            case["error"] = "Interrupted during the previous run; queued for retry."
+            recovered += 1
+
+    fresh["created_at"] = existing.get("created_at", fresh["created_at"])
+    fresh["updated_at"] = iso_now()
+    return fresh, recovered
+
+
+def results_from_state(state, model_patterns):
+    results = {model_name: {} for model_name in model_patterns}
+    for case in state.get("cases", []):
+        model_name = case.get("model")
+        result = case.get("result")
+        if model_name in results and result is not None:
+            results[model_name][int(case["prompt_size"])] = result
+    return results
+
+
+def main(model_patterns, prompt_sizes, reset_state=False, clean_temp=False):
+    if clean_temp:
+        removed = cleanup_temp_artifacts()
+        print(f"Clean-temp mode complete. Removed {len(removed)} artifact(s).")
+        for path in removed:
+            print(f"  Removed: {path}")
+        return
+
     if not os.path.exists(LLAMA_BIN):
         print(f"Error: llama-cli binary not found at {LLAMA_BIN}")
         print("Please run setup.sh first.")
         return
 
-    results = {}
+    fresh_state = build_initial_state(model_patterns, prompt_sizes)
+    existing_state = None
+    if not reset_state:
+        try:
+            existing_state = load_benchmark_state(STATE_FILE)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"Error: could not load benchmark state from {STATE_FILE}: {exc}")
+            print("Use --reset-state to intentionally replace the invalid state file.")
+            return
 
-    for model_name, pattern in MODEL_PATTERNS.items():
+    state, recovered_cases = merge_benchmark_state(existing_state, fresh_state)
+    save_json_atomic(STATE_FILE, state)
+    if reset_state:
+        print(f"Started a fresh benchmark state at {STATE_FILE}")
+    elif existing_state is not None:
+        print(f"Restored benchmark state from {STATE_FILE}")
+    else:
+        print(f"Created benchmark state at {STATE_FILE}")
+    if recovered_cases:
+        print(f"Recovered {recovered_cases} interrupted case(s); they will be retried.")
+
+    cases_by_key = {case["key"]: case for case in state["cases"]}
+    results = results_from_state(state, model_patterns)
+
+    for model_name, pattern in model_patterns.items():
+        model_cases = [case for case in state["cases"] if case["model"] == model_name]
+        if model_cases and all(case.get("status") == "done" for case in model_cases):
+            print(f"All requested {model_name} cases are already cached; skipping model.")
+            continue
+
         model_path = find_or_download_model(model_name, pattern)
         if not model_path:
             print(f"Warning: Model {model_name} not found and download failed/missing.")
@@ -382,50 +573,77 @@ def main():
         
         print(f"Benchmarking {model_name} ({model_path})...")
         
-        # Run calibration test to show token alignment
-        run_calibration_test(model_path)
+        # Run calibration only for cases that are not already cached.
+        pending_prompt_sizes = [
+            int(case["prompt_size"])
+            for case in model_cases
+            if case.get("status") != "done"
+        ]
+        run_calibration_test(model_path, pending_prompt_sizes)
         
-        results[model_name] = {}
+        for size in prompt_sizes:
+            case = cases_by_key[case_key(model_name, size)]
+            if case.get("status") == "done":
+                print(f"  Prompt size {size} already completed; using cached result.")
+                continue
 
-        for size in PROMPT_SIZES:
             print(f"  Running prompt size {size}...")
-            
-            # Get initial prompt estimate, then calibrate to exact token count
-            initial_prompt = get_prompt_text(size * 2)  # Get extra text for calibration room
-            calibrated_prompt, actual_tokens = calibrate_token_count(model_path, initial_prompt, size)
-            
-            print(f"    Calibrated: target={size}, actual={actual_tokens} tokens")
-            
-            temp_prompt_file = f"temp_prompt_{size}.txt"
-            with open(temp_prompt_file, 'w') as f:
-                f.write(calibrated_prompt)
-            
-            # Context size needs to be big enough.
-            ctx = actual_tokens + 128
-            batch_size = actual_tokens
-            if MICRO_BATCH_SIZE > 0:
-                ub = MICRO_BATCH_SIZE
-            elif MICRO_BATCH_SIZE == -2:
-                ub = 4096 if actual_tokens > 4096 else max(1, actual_tokens // 2)
-            else:
-                ub = actual_tokens
+            case["status"] = "running"
+            case["attempts"] = int(case.get("attempts", 0)) + 1
+            case["last_start"] = iso_now()
+            case["last_end"] = None
+            case["model_path"] = model_path
+            case["command"] = None
+            case["error"] = None
+            case["result"] = None
+            state["updated_at"] = iso_now()
+            save_json_atomic(STATE_FILE, state)
 
-            # Construct command
-            cmd = [
-                LLAMA_BIN,
-                "-m", model_path,
-                "-f", temp_prompt_file,
-                "-n", "32",
-                "-c", str(ctx),
-                "-b", str(batch_size),
-                "-ub", str(ub), 
-                "--temp", "0",
-                "-ngl", "99",
-                "-no-cnv"
-            ]
-            
+            case_result = None
+            case_error = None
+            case_status = "failed"
+            temp_prompt_file = None
+            master_fd = None
+            slave_fd = None
             proc = None
+
             try:
+                # Get initial prompt estimate, then calibrate to exact token count
+                initial_prompt = get_prompt_text(size * 2)  # Get extra text for calibration room
+                calibrated_prompt, actual_tokens = calibrate_token_count(model_path, initial_prompt, size)
+
+                print(f"    Calibrated: target={size}, actual={actual_tokens} tokens")
+
+                temp_prompt_file = f"temp_prompt_{size}.txt"
+                with open(temp_prompt_file, 'w') as f:
+                    f.write(calibrated_prompt)
+
+                # Context size needs to be big enough.
+                ctx = actual_tokens + 128
+                batch_size = actual_tokens
+                if MICRO_BATCH_SIZE > 0:
+                    ub = MICRO_BATCH_SIZE
+                elif MICRO_BATCH_SIZE == -2:
+                    ub = 4096 if actual_tokens > 4096 else max(1, actual_tokens // 2)
+                else:
+                    ub = actual_tokens
+
+                # Construct command
+                cmd = [
+                    LLAMA_BIN,
+                    "-m", model_path,
+                    "-f", temp_prompt_file,
+                    "-n", "32",
+                    "-c", str(ctx),
+                    "-b", str(batch_size),
+                    "-ub", str(ub),
+                    "--temp", "0",
+                    "-ngl", "99",
+                    "-no-cnv"
+                ]
+                case["command"] = cmd
+                state["updated_at"] = iso_now()
+                save_json_atomic(STATE_FILE, state)
                 # Use PTY to ensure all output is captured (unbuffered/tty behavior)
                 master_fd, slave_fd = pty.openpty()
                 
@@ -445,6 +663,7 @@ def main():
                 
                 # Close slave in parent
                 os.close(slave_fd)
+                slave_fd = None
                 
                 # Monitor output from master_fd
                 
@@ -518,7 +737,7 @@ def main():
                             proc.kill()
                         break
 
-                    if time.time() - start_time > 180:
+                    if time.time() - start_time > 500:
                         print("Timeout reached, killing process.")
                         proc.kill()
                         break
@@ -550,33 +769,53 @@ def main():
                     print(f"    TTFT: {ttft:.2f} ms")
                     print(f"    Gen Latency: {gen_ms_per_tok:.2f} ms/tok (generated {gen_tokens} tokens)")
                     
-                    results[model_name][size] = {
+                    case_result = {
                         "ttft": ttft,
                         "gen_ms_tok": gen_ms_per_tok,
                         "requested_tokens": size,
                         "actual_tokens": actual_tokens,
                         "gen_tokens": gen_tokens
                     }
+                    case_status = "done"
                 else:
                     print("    Could not parse metrics.")
                     print(f"DEBUG: Collected Output:\n{collected_output[-500:]}")
-                    results[model_name][size] = "Parse Error"
+                    case_result = "Parse Error"
+                    case_error = "Could not parse benchmark metrics from llama.cpp output."
 
             except Exception as e:
                 print(f"    Exception: {e}")
-                results[model_name][size] = "Error"
+                case_result = "Error"
+                case_error = str(e)
             finally:
-                try: os.close(master_fd)
-                except: pass
-                if proc.poll() is None: proc.kill()
-            
-            # Cleanup
-            if os.path.exists(temp_prompt_file):
-                os.remove(temp_prompt_file)
+                if slave_fd is not None:
+                    try:
+                        os.close(slave_fd)
+                    except OSError:
+                        pass
+                if master_fd is not None:
+                    try:
+                        os.close(master_fd)
+                    except OSError:
+                        pass
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                if temp_prompt_file and os.path.exists(temp_prompt_file):
+                    os.remove(temp_prompt_file)
 
-            has_more_runs = (
-                size != PROMPT_SIZES[-1]
-                or model_name != list(MODEL_PATTERNS.keys())[-1]
+            results[model_name][size] = case_result
+            case["status"] = case_status
+            case["last_end"] = iso_now()
+            case["error"] = case_error
+            case["result"] = case_result
+            state["updated_at"] = iso_now()
+            save_json_atomic(STATE_FILE, state)
+            print(f"  Saved {model_name} prompt size {size} to {STATE_FILE}")
+
+            case_index = state["cases"].index(case)
+            has_more_runs = any(
+                later_case.get("status") != "done"
+                for later_case in state["cases"][case_index + 1:]
             )
             if has_more_runs:
                 print(f"  Cooling down for {COOLDOWN_SEC} seconds before next run...")
@@ -589,13 +828,14 @@ def main():
     
     # We will format cells as "1234.5 / 123.4"
     
-    header = f"{'Model':<15} | " + " | ".join([f"{s:<15}" for s in PROMPT_SIZES])
+    model_column_width = max(15, *(len(model_name) for model_name in results))
+    header = f"{'Model':<{model_column_width}} | " + " | ".join([f"{s:<15}" for s in prompt_sizes])
     print(header)
     print("-" * len(header))
     
     for model_name, data in results.items():
-        row = f"{model_name:<15} | "
-        for size in PROMPT_SIZES:
+        row = f"{model_name:<{model_column_width}} | "
+        for size in prompt_sizes:
             val = data.get(size, "N/A")
             if isinstance(val, dict):
                 cell = f"{val['ttft']:.1f} / {val['gen_ms_tok']:.2f}"
@@ -604,5 +844,71 @@ def main():
                 row += f"{str(val):<15} | "
         print(row)
 
+def positive_int(value):
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid integer: {value}") from exc
+    if result <= 0:
+        raise argparse.ArgumentTypeError("prompt sizes must be positive integers")
+    return result
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Benchmark selected llama.cpp models.")
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        choices=MODEL_PATTERNS,
+        default=DEFAULT_MODELS,
+        metavar="MODEL",
+        help=(
+            f"models to benchmark (default: {' '.join(DEFAULT_MODELS)}; "
+            f"choices: {', '.join(MODEL_PATTERNS)})"
+        ),
+    )
+    parser.add_argument(
+        "--prompt-sizes",
+        nargs="+",
+        type=positive_int,
+        default=DEFAULT_PROMPT_SIZES,
+        metavar="TOKENS",
+        help=(
+            "prompt token sizes to benchmark "
+            f"(default: {' '.join(map(str, DEFAULT_PROMPT_SIZES))})"
+        ),
+    )
+    parser.add_argument(
+        "--state-file",
+        type=os.path.abspath,
+        default=STATE_FILE,
+        metavar="PATH",
+        help=f"Benchmark state JSON path (default: {STATE_FILE}).",
+    )
+    parser.add_argument(
+        "--reset-state",
+        action="store_true",
+        help="discard cached progress and start fresh in the selected state file",
+    )
+    parser.add_argument(
+        "--clean-temp",
+        action="store_true",
+        help="remove benchmark.json and leftover temporary prompt/state files, then exit",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    STATE_FILE = args.state_file
+    BENCHMARK_DIR = os.path.dirname(STATE_FILE)
+    os.makedirs(BENCHMARK_DIR, exist_ok=True)
+    selected_model_patterns = {
+        model_name: MODEL_PATTERNS[model_name] for model_name in args.models
+    }
+    main(
+        selected_model_patterns,
+        args.prompt_sizes,
+        reset_state=args.reset_state,
+        clean_temp=args.clean_temp,
+    )

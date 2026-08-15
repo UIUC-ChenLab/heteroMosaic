@@ -72,7 +72,7 @@ extern std::mutex npu_mutex;
 
 // Maximum number of NPU contexts
 #define MAX_NPU_HW_CTX 6
-#define MAX_NPU_INST_CTX 64
+#define MAX_NPU_INST_CTX 128
 
 // Initialize NPU context arrays
 void init_npu();

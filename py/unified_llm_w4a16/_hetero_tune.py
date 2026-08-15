@@ -48,6 +48,7 @@ CW_MAX_CRITICAL_PER_WINDOW = 2
 CW_MAX_NONCRITICAL_PER_WINDOW = 2
 CW_MAX_PROPOSALS_PER_ITER = 64
 CW_RESERVED_SINGLE_TIGHTEN_PROPOSALS = 16
+CW_TRACE_CANDIDATES_PER_ITER = 4
 CW_SEARCH_BUDGET = 8
 CW_LATENCY_GATE_PCT = 0.08
 CW_LATENCY_GATE_FALLBACK_PCT = 0.12
@@ -58,7 +59,8 @@ CW_ACCEPT_ABS_IMPROVEMENT_SEC = 0.005
 CW_ACCEPT_REL_IMPROVEMENT_PCT = 0.005
 CW_CHUNK_QUANTUM = 256
 CW_MIN_CHUNK_SIZE = 512
-CW_STRATEGY_VERSION = "lockstep_attn_proj_min512_v1"
+CW_PARETO_SCHEDULES_PER_CHUNK_COUNT = 4
+CW_STRATEGY_VERSION = "lockstep_pareto_latency_first_resource_v2"
 GEMM_KERNEL_FIELD_ORDER = [
     "use",
     "layer",
@@ -76,8 +78,9 @@ GEMM_KERNEL_FIELD_ORDER = [
     "col",
     "dtype",
 ]
-CHUNK_SIZE_CANDIDATES = [512, 1024, 2048, 4096, 8192]
+CHUNK_SIZE_CANDIDATES = [512, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096, 8192]
 MAX_INFLIGHT = 3
+MAX_SCALAR_CHUNKS = 32
 MAX_SCHEDULE_CHUNKS = 8
 MAX_SCHEDULE_CANDIDATES = 32
 FORCH_INFLIGHT = -1
@@ -398,22 +401,23 @@ def _cw_resolve_effective_inflight(num_chunks, forced_inflight=None, rule=None):
 
     forced = _safe_int(forced_inflight, -1)
     if forced > 0:
-        if forced <= capped_upper and num_chunks % forced == 0:
+        # The runtime drains a partially populated final wave, so chunk count
+        # does not need to be divisible by inflight.
+        if forced <= capped_upper:
             return int(forced)
         return None
 
     required_inflight = int(_cw_target_inflight_for_rule(rule))
-    if required_inflight <= 0 or required_inflight > capped_upper:
+    if required_inflight <= 0:
         return None
-    if num_chunks % required_inflight != 0:
-        return None
-    return int(required_inflight)
+    return int(min(required_inflight, capped_upper))
 
 
 def get_valid_chunk_schedules(prompt_len, max_chunks=MAX_SCHEDULE_CHUNKS, max_candidates=MAX_SCHEDULE_CANDIDATES):
     """
-    Build coarse schedule candidates that exactly sum to prompt_len.
-    Schedules are generated in non-increasing chunk order to avoid permutations.
+    Build coarse schedule candidates that exactly sum to prompt_len. Generate the
+    complete multiset pool first, add order variants that change attention cost,
+    and only then rank and cap the result.
     """
     prompt_len = int(prompt_len)
     if prompt_len <= 0:
@@ -426,14 +430,12 @@ def get_valid_chunk_schedules(prompt_len, max_chunks=MAX_SCHEDULE_CHUNKS, max_ca
     if not candidates:
         return []
 
-    results = []
+    base_schedules = []
 
     def _dfs(remaining, start_idx, acc):
-        if len(results) >= int(max_candidates):
-            return
         if remaining == 0:
             if 1 < len(acc) <= int(max_chunks):
-                results.append(list(acc))
+                base_schedules.append(list(acc))
             return
         if len(acc) >= int(max_chunks):
             return
@@ -447,13 +449,76 @@ def get_valid_chunk_schedules(prompt_len, max_chunks=MAX_SCHEDULE_CHUNKS, max_ca
             acc.append(chunk)
             _dfs(remaining - chunk, idx, acc)
             acc.pop()
-            if len(results) >= int(max_candidates):
-                return
 
     _dfs(prompt_len, 0, [])
-    # Deterministic order: fewer chunks first, then larger front-loaded schedules.
-    results.sort(key=lambda s: (len(s), tuple([-v for v in s])))
-    return results
+
+    def _interleave_extremes(schedule):
+        ordered = sorted(_normalize_chunk_schedule(schedule), reverse=True)
+        interleaved = []
+        left = 0
+        right = len(ordered) - 1
+        while left <= right:
+            interleaved.append(int(ordered[left]))
+            left += 1
+            if left <= right:
+                interleaved.append(int(ordered[right]))
+                right -= 1
+        return interleaved
+
+    ordered_schedules = {}
+    for base in base_schedules:
+        interleaved = _interleave_extremes(base)
+        variants = [
+            list(base),
+            list(reversed(base)),
+            interleaved,
+            list(reversed(interleaved)),
+        ]
+        for variant in variants:
+            ordered_schedules[_chunk_schedule_key(variant)] = variant
+
+    def _rank(schedule):
+        target_inflight = max(1, min(len(schedule), _cw_target_inflight_for_rule()))
+        metrics = _cw_schedule_proxy_metrics(schedule, target_inflight)
+        return (
+            len(schedule),
+            float(metrics["predicted_latency_proxy"]),
+            float(metrics["attention_proxy_spread"]),
+            float(metrics["projection_proxy_spread"]),
+            int(metrics["chunk_size_transitions"]),
+            _chunk_schedule_key(schedule),
+        )
+
+    ranked = sorted(ordered_schedules.values(), key=_rank)
+    if int(max_candidates) < 0:
+        return ranked
+    max_candidates = max(0, int(max_candidates))
+    if max_candidates == 0:
+        return []
+    if len(ranked) <= max_candidates:
+        return ranked
+    selected = []
+    selected_keys = set()
+    by_chunk_count = defaultdict(list)
+    for schedule in ranked:
+        by_chunk_count[len(schedule)].append(schedule)
+    for chunk_count in sorted(by_chunk_count):
+        representative = by_chunk_count[chunk_count][0]
+        schedule_key = _chunk_schedule_key(representative)
+        selected.append(representative)
+        selected_keys.add(schedule_key)
+        if len(selected) >= max_candidates:
+            return selected
+    for schedule in ranked:
+        schedule_key = _chunk_schedule_key(schedule)
+        if schedule_key in selected_keys:
+            continue
+        selected.append(schedule)
+        selected_keys.add(schedule_key)
+        if len(selected) >= max_candidates:
+            break
+    selected.sort(key=_rank)
+    return selected
 
 
 def _cw_schedule_proxy_metrics(chunk_plan, inflight):
@@ -466,6 +531,7 @@ def _cw_schedule_proxy_metrics(chunk_plan, inflight):
             "projection_proxy_spread": float("inf"),
             "attention_proxy_spread": float("inf"),
             "weighted_proxy_total": float("inf"),
+            "predicted_latency_proxy": float("inf"),
             "distinct_chunk_sizes": 0,
             "chunk_size_transitions": 0,
         }
@@ -482,6 +548,11 @@ def _cw_schedule_proxy_metrics(chunk_plan, inflight):
 
     projection_proxy_spread = max(slot_projection_proxy) - min(slot_projection_proxy) if slot_projection_proxy else float("inf")
     attention_proxy_spread = max(slot_attention_proxy) - min(slot_attention_proxy) if slot_attention_proxy else float("inf")
+    prompt_len = max(1, sum(plan))
+    slot_latency_proxy = [
+        float(projection) + (float(attention) / float(prompt_len))
+        for projection, attention in zip(slot_projection_proxy, slot_attention_proxy)
+    ]
     distinct_chunk_sizes = len(set(plan))
     chunk_size_transitions = sum(1 for idx in range(1, len(plan)) if int(plan[idx]) != int(plan[idx - 1]))
     return {
@@ -490,6 +561,7 @@ def _cw_schedule_proxy_metrics(chunk_plan, inflight):
         "projection_proxy_spread": float(projection_proxy_spread),
         "attention_proxy_spread": float(attention_proxy_spread),
         "weighted_proxy_total": float((4.0 * float(attention_proxy_spread)) + float(projection_proxy_spread)),
+        "predicted_latency_proxy": float(max(slot_latency_proxy) if slot_latency_proxy else float("inf")),
         "distinct_chunk_sizes": int(distinct_chunk_sizes),
         "chunk_size_transitions": int(chunk_size_transitions),
     }
@@ -501,6 +573,7 @@ def _cw_schedule_candidate_rank_key(candidate_spec):
     return (
         float(candidate_spec.get("attention_proxy_spread", float("inf"))),
         float(candidate_spec.get("projection_proxy_spread", float("inf"))),
+        float(candidate_spec.get("predicted_latency_proxy", float("inf"))),
         float(candidate_spec.get("weighted_proxy_total", float("inf"))),
         int(candidate_spec.get("distinct_chunk_sizes", len(set(schedule)) if schedule else 0)),
         int(candidate_spec.get("chunk_size_transitions", 0)),
@@ -509,40 +582,91 @@ def _cw_schedule_candidate_rank_key(candidate_spec):
     )
 
 
-def _cw_best_schedule_for_chunk_count(prompt_len, num_chunks, inflight):
+def _cw_schedule_order_variants(schedule):
+    descending = sorted(_normalize_chunk_schedule(schedule), reverse=True)
+    ascending = list(reversed(descending))
+    interleaved = []
+    left = 0
+    right = len(descending) - 1
+    while left <= right:
+        interleaved.append(int(descending[left]))
+        left += 1
+        if left <= right:
+            interleaved.append(int(descending[right]))
+            right -= 1
+    variants = [descending, ascending, interleaved, list(reversed(interleaved))]
+    deduped = {}
+    for variant in variants:
+        deduped[_chunk_schedule_key(variant)] = variant
+    return list(deduped.values())
+
+
+def _cw_schedule_objectives(candidate_spec):
+    return (
+        float(candidate_spec.get("attention_proxy_spread", float("inf"))),
+        float(candidate_spec.get("projection_proxy_spread", float("inf"))),
+        float(candidate_spec.get("predicted_latency_proxy", float("inf"))),
+        int(candidate_spec.get("chunk_size_transitions", 0)),
+    )
+
+
+def _cw_dominates_schedule(lhs, rhs):
+    lhs_values = _cw_schedule_objectives(lhs)
+    rhs_values = _cw_schedule_objectives(rhs)
+    return all(left <= right for left, right in zip(lhs_values, rhs_values)) and any(
+        left < right for left, right in zip(lhs_values, rhs_values)
+    )
+
+
+def _cw_pareto_schedules_for_chunk_count(
+    prompt_len,
+    num_chunks,
+    inflight,
+    max_candidates=CW_PARETO_SCHEDULES_PER_CHUNK_COUNT,
+):
     prompt_len = int(prompt_len)
     num_chunks = int(num_chunks)
     inflight = max(1, int(inflight))
     if prompt_len <= 0 or num_chunks <= 1 or prompt_len % int(CW_CHUNK_QUANTUM) != 0:
-        return None
+        return []
     total_units = int(prompt_len // int(CW_CHUNK_QUANTUM))
     min_chunk_units = max(1, int(CW_MIN_CHUNK_SIZE) // int(CW_CHUNK_QUANTUM))
     if num_chunks > total_units:
-        return None
+        return []
     if num_chunks * min_chunk_units > total_units:
-        return None
+        return []
 
-    best_spec = None
-    best_key = None
+    pareto_specs = []
+    seen = set()
+
+    def _consider_schedule(schedule):
+        for ordered_schedule in _cw_schedule_order_variants(schedule):
+            schedule_key = _chunk_schedule_key(ordered_schedule)
+            if schedule_key in seen:
+                continue
+            seen.add(schedule_key)
+            candidate_spec = {
+                "chunk_size": int(_schedule_fallback_chunk_size(ordered_schedule)),
+                "chunk_schedule": list(ordered_schedule),
+                "effective_inflight": int(inflight),
+                "num_chunks": int(len(ordered_schedule)),
+            }
+            candidate_spec.update(_cw_schedule_proxy_metrics(ordered_schedule, inflight))
+            if any(_cw_dominates_schedule(existing, candidate_spec) for existing in pareto_specs):
+                continue
+            pareto_specs[:] = [
+                existing
+                for existing in pareto_specs
+                if not _cw_dominates_schedule(candidate_spec, existing)
+            ]
+            pareto_specs.append(candidate_spec)
 
     def _dfs(remaining_units, parts_left, max_units, acc_units):
-        nonlocal best_spec, best_key
         if parts_left == 0:
             if remaining_units != 0:
                 return
             schedule = [int(units) * int(CW_CHUNK_QUANTUM) for units in acc_units]
-            metrics = _cw_schedule_proxy_metrics(schedule, inflight)
-            candidate_spec = {
-                "chunk_size": int(_schedule_fallback_chunk_size(schedule)),
-                "chunk_schedule": list(schedule),
-                "effective_inflight": int(inflight),
-                "num_chunks": int(len(schedule)),
-            }
-            candidate_spec.update(metrics)
-            candidate_key = _cw_schedule_candidate_rank_key(candidate_spec)
-            if best_key is None or candidate_key < best_key:
-                best_key = candidate_key
-                best_spec = candidate_spec
+            _consider_schedule(schedule)
             return
 
         max_take = min(
@@ -564,7 +688,38 @@ def _cw_best_schedule_for_chunk_count(prompt_len, num_chunks, inflight):
             acc_units.pop()
 
     _dfs(total_units, num_chunks, total_units, [])
-    return best_spec
+
+    if not pareto_specs:
+        return []
+
+    objective_keys = [
+        lambda spec: (float(spec["attention_proxy_spread"]), _cw_schedule_candidate_rank_key(spec)),
+        lambda spec: (float(spec["projection_proxy_spread"]), _cw_schedule_candidate_rank_key(spec)),
+        lambda spec: (float(spec["predicted_latency_proxy"]), _cw_schedule_candidate_rank_key(spec)),
+        lambda spec: (int(spec["chunk_size_transitions"]), _cw_schedule_candidate_rank_key(spec)),
+    ]
+    selected = []
+    selected_keys = set()
+    for objective_key in objective_keys:
+        winner = min(pareto_specs, key=objective_key)
+        schedule_key = _chunk_schedule_key(winner["chunk_schedule"])
+        if schedule_key in selected_keys:
+            continue
+        selected.append(winner)
+        selected_keys.add(schedule_key)
+        if len(selected) >= max(1, int(max_candidates)):
+            break
+    if len(selected) < max(1, int(max_candidates)):
+        for spec in sorted(pareto_specs, key=_cw_schedule_candidate_rank_key):
+            schedule_key = _chunk_schedule_key(spec["chunk_schedule"])
+            if schedule_key in selected_keys:
+                continue
+            selected.append(spec)
+            selected_keys.add(schedule_key)
+            if len(selected) >= max(1, int(max_candidates)):
+                break
+    selected.sort(key=_cw_schedule_candidate_rank_key)
+    return selected
 
 
 def _cw_select_schedule_candidates_for_active_search(candidate_specs, max_pool=16):
@@ -585,6 +740,7 @@ def _cw_select_schedule_candidates_for_active_search(candidate_specs, max_pool=1
             normalized["projection_proxy_spread"] = float(spec.get("projection_proxy_spread", float("inf")))
             normalized["attention_proxy_spread"] = float(spec.get("attention_proxy_spread", float("inf")))
             normalized["weighted_proxy_total"] = float(spec.get("weighted_proxy_total", float("inf")))
+            normalized["predicted_latency_proxy"] = float(spec.get("predicted_latency_proxy", float("inf")))
             normalized["distinct_chunk_sizes"] = int(spec.get("distinct_chunk_sizes", len(set(schedule))))
             normalized["chunk_size_transitions"] = int(spec.get("chunk_size_transitions", 0))
         else:
@@ -592,7 +748,28 @@ def _cw_select_schedule_candidates_for_active_search(candidate_specs, max_pool=1
         specs.append(normalized)
 
     specs.sort(key=_cw_schedule_candidate_rank_key)
-    return specs[: max(1, int(max_pool))]
+    selected = []
+    selected_keys = set()
+    by_chunk_count = defaultdict(list)
+    for spec in specs:
+        by_chunk_count[int(spec["num_chunks"])].append(spec)
+    for chunk_count in sorted(by_chunk_count):
+        representative = by_chunk_count[chunk_count][0]
+        schedule_key = _chunk_schedule_key(representative["chunk_schedule"])
+        selected.append(representative)
+        selected_keys.add(schedule_key)
+        if len(selected) >= max(1, int(max_pool)):
+            return selected
+    for spec in specs:
+        schedule_key = _chunk_schedule_key(spec["chunk_schedule"])
+        if schedule_key in selected_keys:
+            continue
+        selected.append(spec)
+        selected_keys.add(schedule_key)
+        if len(selected) >= max(1, int(max_pool)):
+            break
+    selected.sort(key=_cw_schedule_candidate_rank_key)
+    return selected
 
 
 def _cw_generate_lockstep_candidate_specs(prompt_len, forced_inflight=None, max_chunks=MAX_SCHEDULE_CHUNKS):
@@ -606,10 +783,8 @@ def _cw_generate_lockstep_candidate_specs(prompt_len, forced_inflight=None, max_
         effective_inflight = _cw_resolve_effective_inflight(num_chunks, forced_inflight=forced_inflight)
         if effective_inflight is None:
             continue
-        best_spec = _cw_best_schedule_for_chunk_count(prompt_len, num_chunks, effective_inflight)
-        if best_spec is None:
-            continue
-        candidate_specs.append(best_spec)
+        pareto_specs = _cw_pareto_schedules_for_chunk_count(prompt_len, num_chunks, effective_inflight)
+        candidate_specs.extend(pareto_specs)
 
     candidate_specs.sort(key=_cw_schedule_candidate_rank_key)
     return candidate_specs
@@ -676,6 +851,81 @@ def _select_schedule_candidates_for_active_search(candidate_specs, max_pool=16):
 
     selected.sort(key=lambda s: (s["shape_score"], _chunk_schedule_key(s["chunk_schedule"])))
     return selected[: int(max_pool)]
+
+
+def _scalar_chunk_inflight_pair_key(pair):
+    return (int(pair.get("chunk_size", 0)), int(pair.get("inflight", 0)))
+
+
+def _select_scalar_chunk_inflight_pairs(candidate_specs, prompt_len, forced_inflight=-1, max_pool=-1):
+    prompt_len = int(prompt_len)
+    forced_inflight = _safe_int(forced_inflight, -1)
+    target_inflight = max(1, int(_cw_target_inflight_for_rule()))
+    pairs = []
+    for candidate in candidate_specs:
+        chunk_size = int(candidate.get("chunk_size", 0))
+        if chunk_size <= 0 or prompt_len % chunk_size != 0:
+            continue
+        num_chunks = int(prompt_len // chunk_size)
+        inflight_candidates = _get_inflight_candidates(num_chunks)
+        if forced_inflight > 0:
+            inflight_candidates = [
+                inflight
+                for inflight in inflight_candidates
+                if int(inflight) == int(forced_inflight)
+            ]
+        for inflight in inflight_candidates:
+            pairs.append(
+                {
+                    "chunk_size": int(chunk_size),
+                    "inflight": int(inflight),
+                    "num_chunks": int(num_chunks),
+                }
+            )
+
+    def _rank(pair):
+        return (
+            abs(int(pair["inflight"]) - min(int(pair["num_chunks"]), int(target_inflight))),
+            abs(int(pair["num_chunks"]) - max(2, int(target_inflight) * 2)),
+            int(pair["num_chunks"]),
+            int(pair["chunk_size"]),
+            int(pair["inflight"]),
+        )
+
+    pairs.sort(key=_rank)
+    if int(max_pool) < 0 or len(pairs) <= int(max_pool):
+        return pairs
+    max_pool = max(1, int(max_pool))
+
+    by_chunk_size = defaultdict(list)
+    for pair in pairs:
+        by_chunk_size[int(pair["chunk_size"])].append(pair)
+    representatives = [
+        sorted(by_chunk_size[chunk_size], key=_rank)[0]
+        for chunk_size in sorted(by_chunk_size)
+    ]
+    if len(representatives) > max_pool:
+        if max_pool == 1:
+            representatives = [representatives[len(representatives) // 2]]
+        else:
+            indices = {
+                int(round(idx * (len(representatives) - 1) / float(max_pool - 1)))
+                for idx in range(max_pool)
+            }
+            representatives = [representatives[idx] for idx in sorted(indices)]
+
+    selected = list(representatives)
+    selected_keys = {_scalar_chunk_inflight_pair_key(pair) for pair in selected}
+    for pair in pairs:
+        pair_key = _scalar_chunk_inflight_pair_key(pair)
+        if pair_key in selected_keys:
+            continue
+        selected.append(pair)
+        selected_keys.add(pair_key)
+        if len(selected) >= max_pool:
+            break
+    selected.sort(key=_rank)
+    return selected[:max_pool]
 
 def _normalize_cpu_model_name(model_name):
     return re.sub(r"\s+", " ", model_name.strip().upper())
@@ -1765,7 +2015,7 @@ def get_valid_chunk_sizes(prompt_len):
         for chunk_size in CHUNK_SIZE_CANDIDATES
         if chunk_size < prompt_len
         and prompt_len % chunk_size == 0
-        and (prompt_len // chunk_size) <= 8
+        and (prompt_len // chunk_size) <= int(MAX_SCALAR_CHUNKS)
     ]
 
 def _resolve_chunk_plan(prompt_len, chunk_size, chunk_schedule=None, require_exact_schedule=False):
@@ -3737,10 +3987,6 @@ def tune_all_gemm_chunking(log_handle, model_conf, mode_variant="gemm_chunking")
                         log_print(str(e), log_handle)
                         raise SystemExit(1)
                     candidate_specs.append({"chunk_size": int(chunk_size), "chunk_schedule": []})
-                log_print(
-                    f"SEARCH_SPACE outer_cap={int(outer_candidate_cap)} is ignored for gemm_chunking mode.",
-                    log_handle,
-                )
                 if forced_chunk_schedule:
                     log_print(
                         "FORCE_CHUNKING_SCHEDULE is ignored for gemm_chunking mode (only used by gemm_chunkingS).",
@@ -3757,6 +4003,38 @@ def tune_all_gemm_chunking(log_handle, model_conf, mode_variant="gemm_chunking")
                 forced_inflight = int(FORCH_INFLIGHT)
             except Exception:
                 forced_inflight = -1
+
+            scalar_pair_allowlist = None
+            if not scheduled_mode:
+                all_scalar_pairs = _select_scalar_chunk_inflight_pairs(
+                    candidate_specs,
+                    prompt_len,
+                    forced_inflight=forced_inflight,
+                    max_pool=-1,
+                )
+                selected_scalar_pairs = _select_scalar_chunk_inflight_pairs(
+                    candidate_specs,
+                    prompt_len,
+                    forced_inflight=forced_inflight,
+                    max_pool=outer_candidate_cap,
+                )
+                scalar_pair_allowlist = {
+                    _scalar_chunk_inflight_pair_key(pair)
+                    for pair in selected_scalar_pairs
+                }
+                if len(selected_scalar_pairs) < len(all_scalar_pairs):
+                    log_print(
+                        f"SEARCH_SPACE outer_cap={int(outer_candidate_cap)}: reduced "
+                        f"{len(all_scalar_pairs)} scalar (chunk_size, inflight) pairs -> "
+                        f"{len(selected_scalar_pairs)} outer candidates.",
+                        log_handle,
+                    )
+                else:
+                    log_print(
+                        f"SEARCH_SPACE outer_cap={int(outer_candidate_cap)}: using all "
+                        f"{len(selected_scalar_pairs)} scalar (chunk_size, inflight) pairs.",
+                        log_handle,
+                    )
 
             if scheduled_mode and (not force_schedule_active):
                 if int(outer_candidate_cap) == -1:
@@ -3858,6 +4136,20 @@ def tune_all_gemm_chunking(log_handle, model_conf, mode_variant="gemm_chunking")
                         f"inflight 1..{max_swept_inflight}) ---",
                         log_handle,
                     )
+
+                if scalar_pair_allowlist is not None:
+                    inflight_candidates = [
+                        inflight
+                        for inflight in inflight_candidates
+                        if (int(chunk_size), int(inflight)) in scalar_pair_allowlist
+                    ]
+                    if not inflight_candidates:
+                        log_print(
+                            f"Skipping {candidate_name}: no (chunk_size, inflight) pair survived "
+                            "the scalar SEARCH_SPACE outer cap.",
+                            log_handle,
+                        )
+                        continue
 
                 candidate_best_inflight = inflight_candidates[0]
                 candidate_best_time = float("inf")
@@ -4422,7 +4714,7 @@ def _cw_propagate_locked_k(trial_data, model_conf, layer_cfg, source_chunk_id, l
     return changed
 
 
-def _cw_make_kernel_action(data, model_conf, num_chunks, node_id, layer_name, direction):
+def _cw_make_kernel_action(data, model_conf, num_chunks, node_id, layer_name, direction, step_mode="coarse"):
     chunk_id, layer_id, stage = node_id
     layer_cfg = _cw_layer_cfg_by_name(model_conf).get(str(layer_name))
     if layer_cfg is None:
@@ -4434,9 +4726,6 @@ def _cw_make_kernel_action(data, model_conf, num_chunks, node_id, layer_name, di
     family_info = _cw_share_index_for_kernel(model_conf, layer_cfg, kernel, chunk_id, num_chunks)
     family = family_info["family"]
     current_index = int(family_info["share_index"])
-    target_index = current_index + 1 if str(direction) == "tighten" else current_index - 1
-    if target_index < 0 or target_index >= len(CW_SHARE_RATIOS):
-        return None
     if family == "K" and not bool(family_info.get("is_source", False)):
         return None
 
@@ -4447,9 +4736,37 @@ def _cw_make_kernel_action(data, model_conf, num_chunks, node_id, layer_name, di
     )
     if not bool(kernel.get("use", True)):
         current_val = 0
-    target_val = _cw_share_value_from_index(model_conf, kernel, family, target_index)
+    target_index = current_index
+    step_mode = str(step_mode).strip().lower()
+    if step_mode == "fine":
+        quantum = 512 if family == "K" else 256
+        dim = _cw_k_share_dim(model_conf, kernel) if family == "K" else max(0, _safe_int(kernel.get("forM", 0), 0))
+        delta = int(quantum) if str(direction) == "tighten" else -int(quantum)
+        target_val = max(0, min(int(dim), int(current_val) + int(delta)))
+        target_val = _round_to_nearest_multiple(target_val, quantum)
+        if family == "K":
+            target_val = _cap_k_tuning_value(
+                model_conf,
+                _safe_int(kernel.get("forK", 0), 0),
+                target_val,
+            )
+        else:
+            target_val = max(0, min(int(dim), int(target_val)))
+    else:
+        target_index = current_index + 1 if str(direction) == "tighten" else current_index - 1
+        if target_index < 0 or target_index >= len(CW_SHARE_RATIOS):
+            return None
+        target_val = _cw_share_value_from_index(model_conf, kernel, family, target_index)
     if int(target_val) == int(current_val) and bool(target_val > 0) == bool(kernel.get("use", True)):
         return None
+
+    if step_mode == "fine":
+        share_summary = f"{family}-share {int(current_val)} -> {int(target_val)} (fine quantum)"
+    else:
+        share_summary = (
+            f"{family}-share {int(CW_SHARE_RATIOS[current_index] * 100)}% -> "
+            f"{int(CW_SHARE_RATIOS[target_index] * 100)}%"
+        )
 
     return {
         "kind": "kernel",
@@ -4462,14 +4779,41 @@ def _cw_make_kernel_action(data, model_conf, num_chunks, node_id, layer_name, di
         "share_index": int(target_index),
         "current_share_index": int(current_index),
         "target_value": int(target_val),
+        "step_mode": str(step_mode),
         "locked_npuK": family_info.get("locked_npuK"),
         "summary": (
             f"{direction} {layer_name} chunk_id={int(chunk_id)} "
-            f"{family}-share {int(CW_SHARE_RATIOS[current_index] * 100)}% -> "
-            f"{int(CW_SHARE_RATIOS[target_index] * 100)}% "
+            f"{share_summary} "
             f"(window node: chunk={int(chunk_id)} layer={int(layer_id)} stage={stage})"
         ),
     }
+
+
+def _cw_make_kernel_actions(data, model_conf, num_chunks, node_id, layer_name, direction):
+    actions = []
+    seen_targets = set()
+    for step_mode in ("coarse", "fine"):
+        action = _cw_make_kernel_action(
+            data,
+            model_conf,
+            num_chunks,
+            node_id,
+            layer_name,
+            direction,
+            step_mode=step_mode,
+        )
+        if action is None:
+            continue
+        target_key = (
+            str(action.get("family", "")),
+            int(action.get("target_value", -1)),
+            int(action.get("locked_npuK", -1)) if action.get("locked_npuK") is not None else -1,
+        )
+        if target_key in seen_targets:
+            continue
+        seen_targets.add(target_key)
+        actions.append(action)
+    return actions
 
 
 def _cw_make_bubble_action(data, node_record):
@@ -4511,7 +4855,24 @@ def _cw_apply_kernel_action(trial_data, model_conf, num_chunks, action):
     before = _cw_kernel_snapshot(kernel)
     family = str(action.get("family", "M"))
     target_index = int(action.get("share_index", 0))
-    target_value = _cw_share_value_from_index(model_conf, kernel, family, target_index)
+    if "target_value" in action:
+        target_value = max(0, _safe_int(action.get("target_value", 0), 0))
+    else:
+        target_value = _cw_share_value_from_index(model_conf, kernel, family, target_index)
+    if family == "K":
+        target_value = _cap_k_tuning_value(
+            model_conf,
+            _safe_int(kernel.get("forK", 0), 0),
+            _round_to_nearest_multiple(target_value, 512),
+        )
+    else:
+        target_value = max(
+            0,
+            min(
+                _safe_int(kernel.get("forM", 0), 0),
+                _round_to_nearest_multiple(target_value, 256),
+            ),
+        )
 
     if family == "M" and action.get("locked_npuK") is not None:
         update_kernel_config_gemm_m_locked_k(
@@ -4619,7 +4980,8 @@ def _cw_proposal_key(edits):
                     str(action.get("layer_name", "")),
                     int(action.get("chunk_id", -1)),
                     str(action.get("family", "")),
-                    int(action.get("share_index", -1)),
+                    int(action.get("target_value", -1)),
+                    int(action.get("locked_npuK", -1)) if action.get("locked_npuK") is not None else -1,
                 )
             )
         elif kind == "bubble":
@@ -4879,6 +5241,69 @@ def _cw_build_trace_state(trace_rows, trace_latency_sec, model_conf):
         if stage == "A" and chunk_id > 0:
             _add_edge((chunk_id - 1, layer_id, "G1"), (chunk_id, layer_id, "A"))
 
+    def _path_exists(src, dst):
+        if src == dst:
+            return True
+        pending = [src]
+        visited = set()
+        while pending:
+            current = pending.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            for successor in succs.get(current, set()):
+                if successor == dst:
+                    return True
+                if successor not in visited:
+                    pending.append(successor)
+        return False
+
+    resource_edge_counts = defaultdict(int)
+
+    def _add_observed_resource_edges(resource_name, resource_nodes):
+        ordered = sorted(
+            set(resource_nodes),
+            key=lambda node_id: (
+                int(node_rows[node_id].get("start_ts_us", 0)),
+                int(node_rows[node_id].get("end_ts_us", 0)),
+                _cw_node_sort_key(node_id),
+            ),
+        )
+        completed = []
+        for node_id in ordered:
+            start_us = int(node_rows[node_id].get("start_ts_us", 0))
+            eligible = [
+                predecessor
+                for predecessor in completed
+                if int(node_rows[predecessor].get("end_ts_us", 0)) <= start_us
+            ]
+            if eligible:
+                predecessor = max(
+                    eligible,
+                    key=lambda candidate: (
+                        int(node_rows[candidate].get("end_ts_us", 0)),
+                        _cw_node_sort_key(candidate),
+                    ),
+                )
+                if node_id not in succs.get(predecessor, set()) and not _path_exists(node_id, predecessor):
+                    _add_edge(predecessor, node_id)
+                    resource_edge_counts[str(resource_name)] += 1
+            completed.append(node_id)
+
+    # A slot represents one reusable GPU stream/scratch context. The shared stage
+    # groups capture observed serialization on the attention GPU and hetero
+    # projection engines without inventing edges between stages that overlapped.
+    nodes_by_slot = defaultdict(list)
+    nodes_by_engine = defaultdict(list)
+    for node_id, row in node_rows.items():
+        nodes_by_slot[int(row.get("slot_id", -1))].append(node_id)
+        engine_name = "attention_gpu" if str(row.get("stage", "")) == "A" else "projection_hetero"
+        nodes_by_engine[engine_name].append(node_id)
+    for slot_id, resource_nodes in nodes_by_slot.items():
+        _add_observed_resource_edges(f"slot:{int(slot_id)}", resource_nodes)
+    for engine_name, resource_nodes in nodes_by_engine.items():
+        _add_observed_resource_edges(engine_name, resource_nodes)
+
     indegree = {node_id: len(pred_set) for node_id, pred_set in preds.items()}
     ready = sorted([node_id for node_id, deg in indegree.items() if deg == 0], key=_cw_node_sort_key)
     topo = []
@@ -5054,6 +5479,7 @@ def _cw_build_trace_state(trace_rows, trace_latency_sec, model_conf):
         "attention_busy_spread_sec": float(attention_busy_spread_sec),
         "projection_busy_spread_sec": float(projection_busy_spread_sec),
         "critical_path_sec": float(total_path_sec),
+        "resource_edge_counts": {str(name): int(count) for name, count in sorted(resource_edge_counts.items())},
         "trace_latency_sec": float(trace_latency_sec),
         "trace_span_sec": float(max(int(record["row"]["end_ts_us"]) for record in node_records.values())) / 1_000_000.0,
         "arch": _cw_model_arch_key(model_conf),
@@ -5090,7 +5516,6 @@ def _cw_apply_latency_gate(
         candidate
         for candidate in candidates
         if math.isfinite(float(candidate.get("true_latency_sec", float("inf"))))
-        and math.isfinite(float(candidate.get("protected_pressure", float("inf"))))
     ]
     if not valid:
         return [], float("inf"), None
@@ -5339,7 +5764,6 @@ def _cw_generate_proposals(data, model_conf, trace_state, num_chunks):
     ranked_windows = protected_windows if protected_windows else candidate_windows
     ranked_windows = sorted(ranked_windows, key=_cw_window_sort_key)
 
-    pair_proposals = []
     single_critical_proposals = []
     single_noncritical_proposals = []
     seen = set()
@@ -5358,29 +5782,27 @@ def _cw_generate_proposals(data, model_conf, trace_state, num_chunks):
         critical_actions = []
         for node_id in critical_nodes:
             for layer_name in _cw_stage_layer_names(model_conf, node_id[2]):
-                action = _cw_make_kernel_action(data, model_conf, num_chunks, node_id, layer_name, "tighten")
-                if action is not None:
-                    critical_actions.append(action)
+                critical_actions.extend(
+                    _cw_make_kernel_actions(data, model_conf, num_chunks, node_id, layer_name, "tighten")
+                )
 
         noncritical_actions = []
         for node_id in noncritical_nodes:
             for layer_name in _cw_stage_layer_names(model_conf, node_id[2]):
-                action = _cw_make_kernel_action(data, model_conf, num_chunks, node_id, layer_name, "relax")
-                if action is not None:
-                    noncritical_actions.append(action)
+                noncritical_actions.extend(
+                    _cw_make_kernel_actions(data, model_conf, num_chunks, node_id, layer_name, "relax")
+                )
             bubble_action = _cw_make_bubble_action(data, node_records[node_id])
             if bubble_action is not None:
                 noncritical_actions.append(bubble_action)
 
         candidate_edit_sets = []
-        for critical_action in critical_actions:
-            for noncritical_action in noncritical_actions:
-                candidate_edit_sets.append([critical_action, noncritical_action])
+        # Apply at most one action before retracing; coupled changes are explored
+        # across successive iterations instead of from stale trace state.
         for critical_action in critical_actions:
             candidate_edit_sets.append([critical_action])
-        if not critical_actions:
-            for noncritical_action in noncritical_actions:
-                candidate_edit_sets.append([noncritical_action])
+        for noncritical_action in noncritical_actions:
+            candidate_edit_sets.append([noncritical_action])
 
         for edits in candidate_edit_sets:
             key = _cw_proposal_key(edits)
@@ -5392,9 +5814,7 @@ def _cw_generate_proposals(data, model_conf, trace_state, num_chunks):
                 "edits": edits,
                 "summary": " + ".join(str(edit.get("summary", "")).strip() for edit in edits if edit.get("summary")),
             }
-            if len(edits) >= 2:
-                pair_proposals.append(proposal)
-            elif edits and str(edits[0].get("kind", "")) == "kernel" and str(edits[0].get("direction", "")) == "tighten":
+            if edits and str(edits[0].get("kind", "")) == "kernel" and str(edits[0].get("direction", "")) == "tighten":
                 single_critical_proposals.append(proposal)
             else:
                 single_noncritical_proposals.append(proposal)
@@ -5404,10 +5824,7 @@ def _cw_generate_proposals(data, model_conf, trace_state, num_chunks):
         len(single_critical_proposals),
         max(0, int(CW_MAX_PROPOSALS_PER_ITER)),
     )
-    max_pair_count = max(0, int(CW_MAX_PROPOSALS_PER_ITER) - int(reserved_single_tightens))
-
-    proposals = list(pair_proposals[:max_pair_count])
-    proposals.extend(single_critical_proposals[:reserved_single_tightens])
+    proposals = list(single_critical_proposals[:reserved_single_tightens])
 
     remaining = max(0, int(CW_MAX_PROPOSALS_PER_ITER) - len(proposals))
     if remaining > 0 and len(single_critical_proposals) > reserved_single_tightens:
@@ -5442,7 +5859,9 @@ def _cw_tune_candidate(
     schedule_tag = _chunk_schedule_file_tag(resolved_schedule)
 
     for iteration_idx in range(1, CW_SEARCH_BUDGET + 1):
-        proposals = _cw_generate_proposals(working_data, model_conf, best_trace_state, num_chunks)
+        iteration_data = _cw_clone_data(working_data)
+        iteration_latency_sec = float(best_latency_sec)
+        proposals = _cw_generate_proposals(iteration_data, model_conf, best_trace_state, num_chunks)
         if not proposals:
             log_print(
                 f"  CW iteration {iteration_idx}: no critical-interval proposals remained; stopping.",
@@ -5450,50 +5869,23 @@ def _cw_tune_candidate(
             )
             break
 
-        improved = False
         log_print(
-            f"  CW iteration {iteration_idx}: evaluating {len(proposals)} proposal(s) "
+            f"  CW iteration {iteration_idx}: latency-screening {len(proposals)} proposal(s) "
             f"(current best true_latency={best_latency_sec:.4f}s, "
             f"protected_pressure={best_trace_state['protected_pressure']:.6f}).",
             log_handle,
         )
+        improving_trials = []
         for proposal_idx, proposal in enumerate(proposals, start=1):
-            trial_data = _cw_apply_edit_set(working_data, model_conf, num_chunks, proposal["edits"])
+            # Every proposal in an iteration is evaluated against the same traced
+            # baseline. This avoids applying stale proposals after an early accept.
+            trial_data = _cw_apply_edit_set(iteration_data, model_conf, num_chunks, proposal["edits"])
             if trial_data is None:
                 continue
             temp_suffix = (
                 f".cw_iter{int(iteration_idx)}_{schedule_tag}_{int(chunk_size)}_{int(inflight)}_"
                 f"trial{int(proposal_idx)}_tmp.json5"
             )
-            trace_recovery_key = _cw_make_recovery_key(
-                "cw_trial_trace",
-                prompt_len,
-                trial_data,
-                trace_sync_stages=False,
-            )
-            trial_trace_latency_sec, trial_trace_rows = _benchmark_gemm_trial_data_with_trace(
-                log_handle,
-                model_conf,
-                prompt_len,
-                trial_data,
-                temp_suffix=temp_suffix,
-                trace_sync_stages=False,
-                heuristics_state=heuristics_state,
-                recovery_key=trace_recovery_key,
-            )
-            if not math.isfinite(trial_trace_latency_sec):
-                log_print(
-                    f"    [trial {proposal_idx}] reject (invalid trace run): {proposal['summary']}",
-                    log_handle,
-                )
-                continue
-            trial_trace_state = _cw_build_trace_state(trial_trace_rows, trial_trace_latency_sec, model_conf)
-            if trial_trace_state is None:
-                log_print(
-                    f"    [trial {proposal_idx}] reject (missing trace rows): {proposal['summary']}",
-                    log_handle,
-                )
-                continue
             latency_recovery_key = _cw_make_recovery_key("cw_trial_latency", prompt_len, trial_data)
             trial_true_latency_sec = _benchmark_gemm_trial_data_latency_only(
                 log_handle,
@@ -5510,31 +5902,104 @@ def _cw_tune_candidate(
                     log_handle,
                 )
                 continue
-            latency_delta_ms = _cw_latency_delta_ms(best_latency_sec, trial_true_latency_sec)
-            if _cw_latency_improves_enough(best_latency_sec, trial_true_latency_sec):
-                working_data = trial_data
-                best_trace_state = trial_trace_state
-                best_latency_sec = float(trial_true_latency_sec)
-                improved = True
+            latency_delta_ms = _cw_latency_delta_ms(iteration_latency_sec, trial_true_latency_sec)
+            if _cw_latency_improves_enough(iteration_latency_sec, trial_true_latency_sec):
+                improving_trials.append(
+                    {
+                        "proposal_idx": int(proposal_idx),
+                        "proposal": proposal,
+                        "trial_data": trial_data,
+                        "true_latency_sec": float(trial_true_latency_sec),
+                        "temp_suffix": temp_suffix,
+                    }
+                )
                 log_print(
-                    f"    [trial {proposal_idx}] ACCEPT {proposal['summary']} "
-                    f"-> true_latency={best_latency_sec:.4f}s ({latency_delta_ms:+.2f} ms), "
-                    f"trace_latency={trial_trace_state['trace_latency_sec']:.4f}s, "
-                    f"protected_pressure={best_trace_state['protected_pressure']:.6f}",
+                    f"    [trial {proposal_idx}] latency survivor {proposal['summary']} "
+                    f"-> true_latency={trial_true_latency_sec:.4f}s ({latency_delta_ms:+.2f} ms)",
                     log_handle,
                 )
             else:
                 log_print(
                     f"    [trial {proposal_idx}] reject {proposal['summary']} "
-                    f"-> true_latency={trial_true_latency_sec:.4f}s ({latency_delta_ms:+.2f} ms), "
-                    f"trace_latency={trial_trace_state['trace_latency_sec']:.4f}s, "
-                    f"protected_pressure={trial_trace_state['protected_pressure']:.6f}",
+                    f"-> true_latency={trial_true_latency_sec:.4f}s ({latency_delta_ms:+.2f} ms)",
                     log_handle,
                 )
 
-        if not improved:
-            log_print(f"  CW iteration {iteration_idx}: no accepted edits; stopping.", log_handle)
+        if not improving_trials:
+            log_print(f"  CW iteration {iteration_idx}: no latency-improving edits; stopping.", log_handle)
             break
+
+        improving_trials.sort(
+            key=lambda trial: (
+                float(trial["true_latency_sec"]),
+                int(trial["proposal_idx"]),
+            )
+        )
+        trace_finalists = improving_trials[: max(1, int(CW_TRACE_CANDIDATES_PER_ITER))]
+        log_print(
+            f"  CW iteration {iteration_idx}: tracing {len(trace_finalists)}/{len(improving_trials)} "
+            "latency-surviving proposal(s), fastest first.",
+            log_handle,
+        )
+
+        accepted_trial = None
+        for finalist in trace_finalists:
+            proposal_idx = int(finalist["proposal_idx"])
+            proposal = finalist["proposal"]
+            trial_data = finalist["trial_data"]
+            trace_recovery_key = _cw_make_recovery_key(
+                "cw_trial_trace",
+                prompt_len,
+                trial_data,
+                trace_sync_stages=False,
+            )
+            trial_trace_latency_sec, trial_trace_rows = _benchmark_gemm_trial_data_with_trace(
+                log_handle,
+                model_conf,
+                prompt_len,
+                trial_data,
+                temp_suffix=finalist["temp_suffix"].replace("_tmp.json5", "_trace_tmp.json5"),
+                trace_sync_stages=False,
+                heuristics_state=heuristics_state,
+                recovery_key=trace_recovery_key,
+            )
+            if not math.isfinite(trial_trace_latency_sec):
+                log_print(
+                    f"    [trial {proposal_idx}] trace finalist reject (invalid trace run): {proposal['summary']}",
+                    log_handle,
+                )
+                continue
+            trial_trace_state = _cw_build_trace_state(trial_trace_rows, trial_trace_latency_sec, model_conf)
+            if trial_trace_state is None:
+                log_print(
+                    f"    [trial {proposal_idx}] trace finalist reject (missing trace rows): {proposal['summary']}",
+                    log_handle,
+                )
+                continue
+            finalist["trace_state"] = trial_trace_state
+            accepted_trial = finalist
+            break
+
+        if accepted_trial is None:
+            log_print(
+                f"  CW iteration {iteration_idx}: every traced latency survivor was invalid; stopping.",
+                log_handle,
+            )
+            break
+
+        working_data = accepted_trial["trial_data"]
+        best_latency_sec = float(accepted_trial["true_latency_sec"])
+        best_trace_state = accepted_trial["trace_state"]
+        accepted_proposal = accepted_trial["proposal"]
+        accepted_idx = int(accepted_trial["proposal_idx"])
+        latency_delta_ms = _cw_latency_delta_ms(iteration_latency_sec, best_latency_sec)
+        log_print(
+            f"    [trial {accepted_idx}] ACCEPT {accepted_proposal['summary']} "
+            f"-> true_latency={best_latency_sec:.4f}s ({latency_delta_ms:+.2f} ms), "
+            f"trace_latency={best_trace_state['trace_latency_sec']:.4f}s, "
+            f"protected_pressure={best_trace_state['protected_pressure']:.6f}",
+            log_handle,
+        )
 
     return working_data, float(best_latency_sec), best_trace_state
 
@@ -5570,13 +6035,6 @@ def tune_all_gemm_cw(log_handle, model_conf):
             log_print(f"{'='*40}", log_handle)
 
             data = setup_baseline_config(data, prompt_len)
-            removed_scheduled_groups = _cw_drop_existing_scheduled_groups(data, prompt_len)
-            if removed_scheduled_groups > 0:
-                log_print(
-                    f"Removed {removed_scheduled_groups} existing scheduled kernels_gemm_chunked group(s) "
-                    f"for prompt_len={prompt_len} before gemm_CW search.",
-                    log_handle,
-                )
             incumbent_chunked = _cw_benchmark_chunked_incumbent(
                 log_handle,
                 model_conf,
@@ -5588,6 +6046,14 @@ def tune_all_gemm_cw(log_handle, model_conf):
                 log_print(
                     f"Best incumbent scheduled chunked config: schedule={_format_chunk_schedule(incumbent_chunked['chunk_schedule'])}, "
                     f"inflight={incumbent_chunked['inflight']}, true_latency={incumbent_chunked['true_latency_sec']:.4f}s",
+                    log_handle,
+                )
+            search_data = _cw_clone_data(data)
+            removed_scheduled_groups = _cw_drop_existing_scheduled_groups(search_data, prompt_len)
+            if removed_scheduled_groups > 0:
+                log_print(
+                    f"Removed {removed_scheduled_groups} incumbent scheduled kernels_gemm_chunked group(s) "
+                    f"from the cloned prompt_len={prompt_len} CW search baseline.",
                     log_handle,
                 )
             unchunked_reference_latency = _cw_benchmark_unchunked_reference(
@@ -5634,7 +6100,7 @@ def tune_all_gemm_cw(log_handle, model_conf):
                     continue
                 try:
                     for unique_chunk in sorted(set(forced_plan)):
-                        get_chunk_baselines_or_raise(data, model_conf, unique_chunk)
+                        get_chunk_baselines_or_raise(search_data, model_conf, unique_chunk)
                 except RuntimeError as exc:
                     log_print(str(exc), log_handle)
                     raise SystemExit(1)
@@ -5671,7 +6137,7 @@ def tune_all_gemm_cw(log_handle, model_conf):
                     chunk_plan = _normalize_chunk_schedule(spec.get("chunk_schedule"))
                     try:
                         for unique_chunk in sorted(set(chunk_plan)):
-                            get_chunk_baselines_or_raise(data, model_conf, unique_chunk)
+                            get_chunk_baselines_or_raise(search_data, model_conf, unique_chunk)
                     except RuntimeError as exc:
                         log_print(
                             f"Skipping lockstep schedule={_format_chunk_schedule(chunk_plan)}: {exc}",
@@ -5693,7 +6159,7 @@ def tune_all_gemm_cw(log_handle, model_conf):
                     )
                     log_print(
                         f"SEARCH_SPACE outer_cap={int(outer_candidate_cap)}: reduced "
-                        f"{len(candidate_specs)} schedules -> {len(reduced_specs)} traced bootstrap candidates.",
+                        f"{len(candidate_specs)} schedules -> {len(reduced_specs)} latency bootstrap candidates.",
                         log_handle,
                     )
                     candidate_specs = [
@@ -5707,6 +6173,7 @@ def tune_all_gemm_cw(log_handle, model_conf):
                             "projection_proxy_spread": float(spec.get("projection_proxy_spread", float("inf"))),
                             "attention_proxy_spread": float(spec.get("attention_proxy_spread", float("inf"))),
                             "weighted_proxy_total": float(spec.get("weighted_proxy_total", float("inf"))),
+                            "predicted_latency_proxy": float(spec.get("predicted_latency_proxy", float("inf"))),
                             "distinct_chunk_sizes": int(spec.get("distinct_chunk_sizes", len(set(spec["chunk_schedule"])))),
                             "chunk_size_transitions": int(spec.get("chunk_size_transitions", 0)),
                         }
@@ -5715,11 +6182,11 @@ def tune_all_gemm_cw(log_handle, model_conf):
                 else:
                     log_print(
                         f"SEARCH_SPACE outer_cap={int(outer_candidate_cap)}: using all "
-                        f"{len(candidate_specs)} schedule candidates for traced bootstrap.",
+                        f"{len(candidate_specs)} schedule candidates for latency bootstrap.",
                         log_handle,
                     )
 
-            bootstrap_candidates = []
+            latency_candidates = []
             for candidate in candidate_specs:
                 chunk_size = int(candidate["chunk_size"])
                 chunk_schedule = _normalize_chunk_schedule(candidate.get("chunk_schedule"))
@@ -5738,7 +6205,7 @@ def tune_all_gemm_cw(log_handle, model_conf):
                     continue
 
                 trial_data, _, resolved_schedule = build_chunking_trial_data(
-                    data,
+                    search_data,
                     model_conf,
                     prompt_len,
                     chunk_size,
@@ -5769,6 +6236,49 @@ def tune_all_gemm_cw(log_handle, model_conf):
                         log_handle,
                     )
                     continue
+                latency_candidates.append(
+                    {
+                        "chunk_size": int(chunk_size),
+                        "chunk_schedule": list(resolved_schedule),
+                        "inflight": int(inflight),
+                        "true_latency_sec": float(true_latency_sec),
+                        "projection_proxy_spread": float(candidate.get("projection_proxy_spread", float("inf"))),
+                        "attention_proxy_spread": float(candidate.get("attention_proxy_spread", float("inf"))),
+                        "predicted_latency_proxy": float(candidate.get("predicted_latency_proxy", float("inf"))),
+                        "trial_data": trial_data,
+                    }
+                )
+                log_print(
+                    f"  Bootstrap latency candidate schedule={_format_chunk_schedule(chunk_plan)}, "
+                    f"inflight={inflight}: true_latency={true_latency_sec:.4f}s",
+                    log_handle,
+                )
+
+            if not latency_candidates:
+                log_print(f"No valid bootstrap latency candidates for prompt size {prompt_len}.", log_handle)
+                continue
+
+            gated_latency_candidates, best_chunked_latency, used_gate_pct = _cw_apply_latency_gate(latency_candidates)
+            if used_gate_pct is None:
+                log_print(
+                    "Latency gate fallback: retaining all valid chunked candidates because no gated survivors remained.",
+                    log_handle,
+                )
+            else:
+                log_print(
+                    f"Latency gate kept {len(gated_latency_candidates)}/{len(latency_candidates)} chunked candidates: "
+                    f"true_latency <= {best_chunked_latency * (1.0 + used_gate_pct):.4f}s "
+                    f"({int(round(used_gate_pct * 100.0))}% over best chunked latency {best_chunked_latency:.4f}s).",
+                    log_handle,
+                )
+
+            bootstrap_candidates = []
+            for candidate in gated_latency_candidates:
+                chunk_size = int(candidate["chunk_size"])
+                resolved_schedule = _normalize_chunk_schedule(candidate.get("chunk_schedule"))
+                inflight = int(candidate["inflight"])
+                trial_data = candidate["trial_data"]
+                schedule_tag = _chunk_schedule_file_tag(resolved_schedule)
                 trace_recovery_key = _cw_make_recovery_key(
                     "cw_bootstrap_trace",
                     prompt_len,
@@ -5789,25 +6299,22 @@ def tune_all_gemm_cw(log_handle, model_conf):
                 )
                 if not math.isfinite(trace_latency_sec):
                     log_print(
-                        f"  Bootstrap reject schedule={_format_chunk_schedule(chunk_plan)}, inflight={inflight}: "
-                        "invalid/timeout trace benchmark result.",
+                        f"  Bootstrap trace reject schedule={_format_chunk_schedule(resolved_schedule)}, "
+                        f"inflight={inflight}: invalid/timeout trace benchmark result.",
                         log_handle,
                     )
                     continue
                 trace_state = _cw_build_trace_state(trace_rows, trace_latency_sec, model_conf)
                 if trace_state is None:
                     log_print(
-                        f"  Bootstrap reject schedule={_format_chunk_schedule(chunk_plan)}, inflight={inflight}: "
-                        "missing trace rows.",
+                        f"  Bootstrap trace reject schedule={_format_chunk_schedule(resolved_schedule)}, "
+                        f"inflight={inflight}: missing trace rows.",
                         log_handle,
                     )
                     continue
-                bootstrap_candidates.append(
+                traced_candidate = dict(candidate)
+                traced_candidate.update(
                     {
-                        "chunk_size": int(chunk_size),
-                        "chunk_schedule": list(resolved_schedule),
-                        "inflight": int(inflight),
-                        "true_latency_sec": float(true_latency_sec),
                         "trace_latency_sec": float(trace_latency_sec),
                         "pressure": float(trace_state["pressure"]),
                         "base_pressure": float(trace_state["base_pressure"]),
@@ -5816,15 +6323,13 @@ def tune_all_gemm_cw(log_handle, model_conf):
                         "protected_pressure": float(trace_state["protected_pressure"]),
                         "attention_busy_spread_sec": float(trace_state["attention_busy_spread_sec"]),
                         "projection_busy_spread_sec": float(trace_state["projection_busy_spread_sec"]),
-                        "projection_proxy_spread": float(candidate.get("projection_proxy_spread", float("inf"))),
-                        "attention_proxy_spread": float(candidate.get("attention_proxy_spread", float("inf"))),
-                        "trial_data": trial_data,
                         "trace_state": trace_state,
                     }
                 )
+                bootstrap_candidates.append(traced_candidate)
                 log_print(
-                    f"  Bootstrap candidate schedule={_format_chunk_schedule(chunk_plan)}, inflight={inflight}: "
-                    f"true_latency={true_latency_sec:.4f}s trace_latency={trace_latency_sec:.4f}s "
+                    f"  Bootstrap traced candidate schedule={_format_chunk_schedule(resolved_schedule)}, inflight={inflight}: "
+                    f"true_latency={candidate['true_latency_sec']:.4f}s trace_latency={trace_latency_sec:.4f}s "
                     f"attention_busy_spread={trace_state['attention_busy_spread_sec']:.6f}s "
                     f"projection_busy_spread={trace_state['projection_busy_spread_sec']:.6f}s "
                     f"base_pressure={trace_state['base_pressure']:.6f} "
@@ -5835,22 +6340,8 @@ def tune_all_gemm_cw(log_handle, model_conf):
                 )
 
             if not bootstrap_candidates:
-                log_print(f"No valid bootstrap candidates for prompt size {prompt_len}.", log_handle)
+                log_print(f"No latency-gated bootstrap candidate produced a valid trace for prompt size {prompt_len}.", log_handle)
                 continue
-
-            gated_candidates, best_chunked_latency, used_gate_pct = _cw_apply_latency_gate(bootstrap_candidates)
-            if used_gate_pct is None:
-                log_print(
-                    "Latency gate fallback: retaining all valid chunked candidates because no gated survivors remained.",
-                    log_handle,
-                )
-            else:
-                log_print(
-                    f"Latency gate kept {len(gated_candidates)}/{len(bootstrap_candidates)} chunked candidates: "
-                    f"true_latency <= {best_chunked_latency * (1.0 + used_gate_pct):.4f}s "
-                    f"({int(round(used_gate_pct * 100.0))}% over best chunked latency {best_chunked_latency:.4f}s).",
-                    log_handle,
-                )
 
             bootstrap_candidates.sort(key=_cw_bootstrap_rank_key)
             log_print("Bootstrap ranking by lockstep attention/projection balance:", log_handle)
@@ -5869,11 +6360,11 @@ def tune_all_gemm_cw(log_handle, model_conf):
                 )
 
             if int(final_candidate_cap) == -1:
-                candidate_trials = gated_candidates
+                candidate_trials = bootstrap_candidates
                 log_print("SEARCH_SPACE final_cap=-1: tuning every latency-gated bootstrap candidate.", log_handle)
             else:
                 final_count = max(1, int(final_candidate_cap))
-                candidate_trials = gated_candidates[:final_count]
+                candidate_trials = bootstrap_candidates[:final_count]
                 log_print(
                     f"SEARCH_SPACE final_cap={final_count}: tuning top {len(candidate_trials)} latency-gated "
                     "lockstep-balanced candidates.",
@@ -5954,6 +6445,7 @@ def tune_all_gemm_cw(log_handle, model_conf):
                     )
                 continue
 
+            _cw_drop_existing_scheduled_groups(data, prompt_len)
             _apply_chunking_format(
                 data,
                 best_final_chunk_size,
@@ -7387,7 +7879,7 @@ def main():
         if args.mode == "gemm_chunking" or args.mode == "all":
             tune_all_gemm_chunking(log_handle, model_conf, mode_variant="gemm_chunking")
 
-        if args.mode == "gemm_chunkingS":
+        if args.mode == "gemm_chunkingS": # deprecated
             tune_all_gemm_chunking(log_handle, model_conf, mode_variant="gemm_chunkingS")
 
         if args.mode == "gemm_CW" or args.mode == "all":

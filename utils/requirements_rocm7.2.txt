@@ -1,4 +1,0 @@
---index-url https://download.pytorch.org/whl/rocm7.2
-torch
-torchvision
-torchaudio

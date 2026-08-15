@@ -9,29 +9,26 @@ import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
-# PROMPT_SIZES = [1024, 2048, 4096, 8192, 16384]
-PROMPT_SIZES = [256, 512, 1024, 2048, 4096, 8192]
+PROMPT_SIZES = [1024, 2048, 4096, 8192, 16384]
+# PROMPT_SIZES = [256, 512, 1024, 2048, 4096, 8192]
 MICRO_BATCH_SIZE = -2
-DEFAULT_TIMEOUT_SEC = 300
-WARMUP = False
+DEFAULT_TIMEOUT_SEC = 500
+WARMUP = True
 DUMMY_WEIGHTS = True
-RUN_GEN = False
+RUN_GEN = True
 COOLDOWN_SEC = 16
 RETRY = 3
 GEN_COMPARE_MAX_NEW_TOKENS = 16
 SPECIAL_NPU_16K_CTX_LEN = 16384
 DO_NOT_SEARCH_MP = True
-TILE_FUSE = False
-TILE_FUSE_NPU_MODE = "npu-sim"
-
 
 # Default model target for benchmarks.
 # Available values:
 # MODEL = "gemma"
-MODEL = "llama3_8b"
+# MODEL = "llama3_8b"
 # MODEL = "llama3_70b"
 # MODEL = "phi3.5_3.8b"
-# MODEL = "qwen14b"
+MODEL = "qwen14b"
 # MODEL = "qwen3b"
 
 SYSTEM_PROFILE_TOKEN_MAP = [
@@ -134,9 +131,12 @@ MODELS = [
 ]
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = os.path.join(SCRIPT_DIR, "benchmark.json")
+REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, "..", ".."))
+BENCHMARK_DIR = os.path.join(REPO_ROOT, "build", "benchmarks", "heteroMosaic")
+os.makedirs(BENCHMARK_DIR, exist_ok=True)
+STATE_FILE = os.path.join(BENCHMARK_DIR, "benchmark.json")
 LOG_FILE = os.path.join(
-    SCRIPT_DIR,
+    BENCHMARK_DIR,
     f"benchmark_run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
 )
 
@@ -275,11 +275,11 @@ def cleanup_temp_log_files(state_path: str, run_log_path: Optional[str] = None) 
     removed_baks = 0
     removed_state = 0
 
-    # Cleanup-only mode: remove all benchmark run logs in script dir.
+    # Cleanup-only mode: remove all benchmark run logs in the benchmark output dir.
     if run_log_path is None:
-        for name in os.listdir(SCRIPT_DIR):
+        for name in os.listdir(BENCHMARK_DIR):
             if re.fullmatch(r"benchmark_run_\d{8}_\d{6}\.log", name):
-                path = os.path.join(SCRIPT_DIR, name)
+                path = os.path.join(BENCHMARK_DIR, name)
                 if os.path.isfile(path):
                     try:
                         os.remove(path)
@@ -383,27 +383,6 @@ def _build_scenarios_for_prompt_size(size: int, allow_chunking_s: bool) -> List[
     return scenarios
 
 
-def _should_keep_case_for_tile_fuse(
-    backend: str, chunking: bool, scheduled: bool, minimal_pdi: bool
-) -> bool:
-    if not TILE_FUSE:
-        return True
-    # Tile-fuse benchmarking only keeps the baseline NPU prefill path.
-    return backend == "npu" and not chunking and not scheduled and minimal_pdi
-
-
-def _case_heterogeneity(case: dict) -> str:
-    if (
-        TILE_FUSE
-        and case["backend"] == "npu"
-        and not bool(case["chunking"])
-        and not bool(case["chunking_scheduled"])
-        and bool(case["minimal_pdi"])
-    ):
-        return TILE_FUSE_NPU_MODE
-    return case["backend"]
-
-
 def make_cases(model: dict, prompt_sizes: List[int], micro_batch_size: int) -> List[dict]:
     cases: List[dict] = []
     default_gpu_chunking_inflight = _detect_default_gpu_chunking_inflight()
@@ -415,10 +394,6 @@ def make_cases(model: dict, prompt_sizes: List[int], micro_batch_size: int) -> L
 
         for backend, chunking, scheduled in _build_scenarios_for_prompt_size(size, allow_chunking_s):
             for minimal_pdi in _search_minimal_pdi_values(backend, bool(chunking), bool(scheduled)):
-                if not _should_keep_case_for_tile_fuse(
-                    backend, bool(chunking), bool(scheduled), bool(minimal_pdi)
-                ):
-                    continue
                 case = {
                     "model": model["name"],
                     "script": model["script"],
@@ -454,11 +429,7 @@ def expected_case_count(prompt_sizes: List[int], model: Optional[dict] = None) -
     allow_chunking_s = _model_chunking_s_enabled(model)
     for size in prompt_sizes:
         for backend, chunking, scheduled in _build_scenarios_for_prompt_size(size, allow_chunking_s):
-            for minimal_pdi in _search_minimal_pdi_values(backend, bool(chunking), bool(scheduled)):
-                if _should_keep_case_for_tile_fuse(
-                    backend, bool(chunking), bool(scheduled), bool(minimal_pdi)
-                ):
-                    total += 1
+            total += len(_search_minimal_pdi_values(backend, bool(chunking), bool(scheduled)))
     return total
 
 
@@ -564,8 +535,218 @@ def merge_state(existing: dict, fresh: dict) -> dict:
     return out
 
 
-def find_next_case_index(cases: List[dict]) -> Optional[int]:
+def merge_point_update_state(existing: dict, fresh: dict) -> Tuple[dict, set, bool]:
+    """Replace only selected fresh cases while preserving every other cached case."""
+    if not isinstance(existing, dict):
+        raise ValueError("Point update requires an existing benchmark.json state file.")
+    if existing.get("model") != fresh.get("model") or existing.get("script") != fresh.get("script"):
+        raise ValueError(
+            "Point update model does not match the cached state; use a normal run or --reset-state."
+        )
+    if existing.get("config_path") != fresh.get("config_path"):
+        raise ValueError(
+            "Point update config path does not match the cached state; use a normal run or --reset-state."
+        )
+
+    fresh_by_key = {case["key"]: case for case in fresh.get("cases", [])}
+    active_keys = set(fresh_by_key)
+    existing_point_update = existing.get("point_update")
+    resuming = (
+        isinstance(existing_point_update, dict)
+        and existing_point_update.get("status") == "running"
+        and set(existing_point_update.get("active_case_keys") or []) == active_keys
+    )
+    merged_cases = []
+    consumed_keys = set()
+    preserved_fields = [
+        "status",
+        "attempts",
+        "last_start",
+        "last_end",
+        "returncode",
+        "error",
+        "metrics",
+        "command",
+        "last_output_tail",
+    ]
+
+    old_cases = existing.get("cases", []) if isinstance(existing.get("cases"), list) else []
+    for old_case in old_cases:
+        key = old_case.get("key")
+        if key in fresh_by_key:
+            replacement = dict(fresh_by_key[key])
+            if resuming:
+                for field in preserved_fields:
+                    if field in old_case:
+                        replacement[field] = old_case[field]
+                if replacement.get("status") == "running":
+                    replacement["status"] = "timeout"
+                    replacement["error"] = "Interrupted while running (likely reboot or kill)."
+                    replacement["last_end"] = iso_now()
+            merged_cases.append(replacement)
+            consumed_keys.add(key)
+        else:
+            merged_cases.append(dict(old_case))
+
+    for fresh_case in fresh.get("cases", []):
+        if fresh_case["key"] not in consumed_keys:
+            merged_cases.append(dict(fresh_case))
+
+    for idx, case in enumerate(merged_cases):
+        case["id"] = idx
+
+    out = dict(existing)
+    for field in [
+        "version",
+        "model",
+        "script",
+        "config_path",
+        "cpu_model_name",
+        "micro_batch_size",
+        "gen_compare_max_new_tokens",
+        "timeout_sec",
+    ]:
+        if field in fresh:
+            out[field] = fresh[field]
+
+    old_prompt_sizes = existing.get("prompt_sizes", [])
+    out["prompt_sizes"] = list(
+        dict.fromkeys(
+            [int(size) for size in old_prompt_sizes]
+            + [int(size) for size in fresh.get("prompt_sizes", [])]
+        )
+    )
+    out["cases"] = merged_cases
+    out["log_files"] = list(
+        dict.fromkeys((existing.get("log_files") or []) + (fresh.get("log_files") or []))
+    )
+    if resuming:
+        point_update = dict(existing_point_update)
+        point_update["resumed_at"] = iso_now()
+    else:
+        point_update = {
+            "started_at": iso_now(),
+            "completed_at": None,
+        }
+    point_update["status"] = "running"
+    point_update["prompt_sizes"] = [int(size) for size in fresh.get("prompt_sizes", [])]
+    point_update["active_case_keys"] = sorted(active_keys)
+    out["point_update"] = point_update
+    out["updated_at"] = iso_now()
+    return out, active_keys, resuming
+
+
+def resolve_point_update_case_ids(existing: dict, requested_case_ids: List[int]) -> Tuple[List[int], set, List[int]]:
+    """Resolve cached case IDs to stable case keys and their prompt sizes."""
+    if not isinstance(existing, dict):
+        raise ValueError("Selecting --case-ids requires an existing benchmark.json state file.")
+
+    requested_ids = list(dict.fromkeys(int(case_id) for case_id in requested_case_ids))
+    old_cases = existing.get("cases", []) if isinstance(existing.get("cases"), list) else []
+    cases_by_id = {}
+    for case in old_cases:
+        try:
+            case_id = int(case.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if case_id in cases_by_id:
+            raise ValueError(f"Cached benchmark state contains duplicate case ID {case_id}.")
+        cases_by_id[case_id] = case
+
+    missing_ids = [case_id for case_id in requested_ids if case_id not in cases_by_id]
+    if missing_ids:
+        available_ids = " ".join(str(case_id) for case_id in sorted(cases_by_id)) or "none"
+        missing_text = " ".join(str(case_id) for case_id in missing_ids)
+        raise ValueError(
+            f"Unknown cached case ID(s): {missing_text}. Available case IDs: {available_ids}."
+        )
+
+    selected_cases = [cases_by_id[case_id] for case_id in requested_ids]
+    missing_keys = [case_id for case_id, case in zip(requested_ids, selected_cases) if not case.get("key")]
+    if missing_keys:
+        raise ValueError(
+            "Cached case ID(s) are missing stable case keys: "
+            + " ".join(str(case_id) for case_id in missing_keys)
+            + ". Run a normal benchmark to rebuild the state."
+        )
+
+    selected_keys = {str(case["key"]) for case in selected_cases}
+    prompt_sizes = list(dict.fromkeys(int(case["prompt_size"]) for case in selected_cases))
+    return requested_ids, selected_keys, prompt_sizes
+
+
+def filter_fresh_cases_for_point_update(fresh: dict, selected_keys: set) -> dict:
+    """Limit a freshly generated state to the exact cached cases being refreshed."""
+    filtered = dict(fresh)
+    filtered_cases = [
+        case for case in fresh.get("cases", []) if case.get("key") in selected_keys
+    ]
+    found_keys = {case.get("key") for case in filtered_cases}
+    missing_keys = selected_keys - found_keys
+    if missing_keys:
+        raise ValueError(
+            "The selected cached case(s) no longer exist in the current benchmark matrix. "
+            "Run a normal benchmark to rebuild the state before using --case-ids."
+        )
+    filtered["cases"] = filtered_cases
+    return filtered
+
+
+def filter_fresh_cases_by_scenario(
+    fresh: dict,
+    backend: Optional[str] = None,
+    chunking: Optional[bool] = None,
+    chunking_scheduled: Optional[bool] = None,
+    minimal_pdi: Optional[bool] = None,
+) -> dict:
+    """Limit a point update using human-readable benchmark fields."""
+    filtered = dict(fresh)
+    filtered_cases = []
+    for case in fresh.get("cases", []):
+        if backend is not None and case.get("backend") != backend:
+            continue
+        if chunking is not None and bool(case.get("chunking")) != chunking:
+            continue
+        if (
+            chunking_scheduled is not None
+            and bool(case.get("chunking_scheduled")) != chunking_scheduled
+        ):
+            continue
+        if minimal_pdi is not None and bool(case.get("minimal_pdi")) != minimal_pdi:
+            continue
+        filtered_cases.append(case)
+
+    if not filtered_cases:
+        raise ValueError(
+            "No benchmark cases match the selected prompt sizes and scenario fields."
+        )
+    filtered["cases"] = filtered_cases
+    return filtered
+
+
+def format_point_update_scenario(
+    prompt_sizes: List[int],
+    backend: Optional[str],
+    chunking: Optional[bool],
+    chunking_scheduled: Optional[bool],
+    minimal_pdi: Optional[bool],
+) -> str:
+    fields = [f"prompt sizes={prompt_sizes}"]
+    if backend is not None:
+        fields.append(f"backend={backend}")
+    if chunking is not None:
+        fields.append(f"chunking={str(chunking).lower()}")
+    if chunking_scheduled is not None:
+        fields.append(f"chunking scheduled={str(chunking_scheduled).lower()}")
+    if minimal_pdi is not None:
+        fields.append(f"minimal PDI={str(minimal_pdi).lower()}")
+    return ", ".join(fields)
+
+
+def find_next_case_index(cases: List[dict], active_keys: Optional[set] = None) -> Optional[int]:
     for idx, case in enumerate(cases):
+        if active_keys is not None and case.get("key") not in active_keys:
+            continue
         if case.get("status") != "done":
             return idx
     return None
@@ -632,7 +813,7 @@ def _build_case_config_dict(backup_path: str, case: dict) -> dict:
     cfg["warmup"] = bool(WARMUP)
     cfg["dummy_weights"] = bool(DUMMY_WEIGHTS)
     cfg["prompt_len"] = int(case["prompt_size"])
-    cfg["heterogeneity"] = _case_heterogeneity(case)
+    cfg["heterogeneity"] = case["backend"]
     cfg["chunking"] = bool(case["chunking"])
     cfg["chunking_scheduled"] = bool(case["chunking_scheduled"])
     cfg["minimal_pdi"] = bool(case["minimal_pdi"])
@@ -704,7 +885,7 @@ def apply_case_config_from_backup(config_path: str, backup_path: str, case: dict
     ok &= replace_one(r'("warmup"\s*:\s*)(true|false|-?\d+)', rf'\g<1>{bool_str(WARMUP)}')
     ok &= replace_one(r'("dummy_weights"\s*:\s*)(true|false|-?\d+)', rf'\g<1>{bool_str(DUMMY_WEIGHTS)}')
     ok &= replace_one(r'("prompt_len"\s*:\s*)(-?\d+)', rf'\g<1>{int(case["prompt_size"])}')
-    ok &= replace_one(r'("heterogeneity"\s*:\s*)"[^"]*"', rf'\g<1>"{_case_heterogeneity(case)}"')
+    ok &= replace_one(r'("heterogeneity"\s*:\s*)"[^"]*"', rf'\g<1>"{case["backend"]}"')
     ok &= replace_one(r'("chunking"\s*:\s*)(true|false|-?\d+)', rf'\g<1>{bool_str(case["chunking"])}')
     ok &= replace_one(r'("chunking_scheduled"\s*:\s*)(true|false|-?\d+)', rf'\g<1>{bool_str(case["chunking_scheduled"])}')
     ok &= replace_one(r'("minimal_pdi"\s*:\s*)(true|false|-?\d+)', rf'\g<1>{bool_str(case["minimal_pdi"])}')
@@ -833,12 +1014,12 @@ def _run_generation_compare(script: str, timeout_sec: int, log_handle, backup_pa
 
 def run_single_case(case: dict, timeout_sec: int, log_handle, backup_path: str) -> Tuple[str, int, Dict[str, float], str, str]:
     scenario = (
-        f"{case['backend']}|chunking={str(case['chunking']).lower()}|"
-        f"scheduled={str(case['chunking_scheduled']).lower()}|"
-        f"pdi={str(case['minimal_pdi']).lower()}"
+        f"backend={case['backend']}, chunking={str(case['chunking']).lower()}, "
+        f"chunking scheduled={str(case['chunking_scheduled']).lower()}, "
+        f"minimal PDI={str(case['minimal_pdi']).lower()}"
     )
     if bool(case.get("chunking", False)):
-        scenario += f"|ub={case['gpu_chunk_size']}"
+        scenario += f", GPU chunk size={case['gpu_chunk_size']}"
     script = case["script"]
     size = int(case["prompt_size"])
     cmd_str = (
@@ -861,30 +1042,26 @@ def run_single_case(case: dict, timeout_sec: int, log_handle, backup_path: str) 
 
 def print_summary(state: dict, log_handle) -> None:
     cases = state.get("cases", [])
-    log_print("\n" + "#" * 140, log_handle)
+    log_print("\n" + "#" * 180, log_handle)
     log_print("FINAL BENCHMARK SUMMARY", log_handle)
-    log_print("#" * 140, log_handle)
+    log_print("#" * 180, log_handle)
     log_print(
-        "Legend: c=0 -> chunking=false, cs=0 -> chunking_scheduled=false, mp=1 -> minimal_pdi=true",
+        f"{'ID':<4} | {'Size':<6} | {'Scenario':<98} | {'Status':<8} | {'Prefill(s)':<10}",
         log_handle,
     )
-    log_print(
-        f"{'ID':<4} | {'Size':<6} | {'Scenario':<58} | {'Status':<8} | {'Prefill(s)':<10}",
-        log_handle,
-    )
-    log_print("-" * 140, log_handle)
+    log_print("-" * 180, log_handle)
 
     for c in cases:
         scenario = (
-            f"{c['backend']}/c={int(bool(c['chunking']))}/"
-            f"cs={int(bool(c['chunking_scheduled']))}/"
-            f"mp={int(bool(c.get('minimal_pdi', True)))}"
+            f"backend={c['backend']}, chunking={str(bool(c['chunking'])).lower()}, "
+            f"chunking scheduled={str(bool(c['chunking_scheduled'])).lower()}, "
+            f"minimal PDI={str(bool(c.get('minimal_pdi', True))).lower()}"
         )
         if bool(c.get("chunking", False)):
-            scenario += f"/ub={c['gpu_chunk_size']}"
+            scenario += f", GPU chunk size={c['gpu_chunk_size']}"
         m = c.get("metrics") or {}
         log_print(
-            f"{c['id']:<4} | {c['prompt_size']:<6} | {scenario:<58} | {c.get('status','?'):<8} | "
+            f"{c['id']:<4} | {c['prompt_size']:<6} | {scenario:<98} | {c.get('status','?'):<8} | "
             f"{float(m.get('prefill_s', 0.0)):<10.4f}",
             log_handle,
         )
@@ -892,7 +1069,7 @@ def print_summary(state: dict, log_handle) -> None:
     generation_compare = state.get("generation_compare") or {}
     generation_metrics = generation_compare.get("metrics") or {}
     log_print("\nGENERATION COMPARE", log_handle)
-    log_print("-" * 140, log_handle)
+    log_print("-" * 180, log_handle)
     if not RUN_GEN:
         log_print("Status: skipped | RUN_GEN is False", log_handle)
         return
@@ -951,17 +1128,147 @@ def run_generation_compare_once(state: dict, model: dict, timeout_sec: int, log_
     return False
 
 
+def positive_int(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid integer: {value}") from exc
+    if result <= 0:
+        raise argparse.ArgumentTypeError("prompt sizes must be positive integers")
+    return result
+
+
+def non_negative_int(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid integer: {value}") from exc
+    if result < 0:
+        raise argparse.ArgumentTypeError("case IDs must be non-negative integers")
+    return result
+
+
+def boolean_arg(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in ("true", "1", "yes", "on"):
+        return True
+    if normalized in ("false", "0", "no", "off"):
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Hetero Mosaic benchmark runner for prompt prefill plus generation comparison.")
+    parser.add_argument(
+        "--model",
+        choices=[str(model["id"]) for model in MODELS],
+        default=MODEL,
+        help=f"Model to benchmark (default: {MODEL}).",
+    )
+    parser.add_argument(
+        "--prompt-sizes",
+        nargs="+",
+        type=positive_int,
+        default=PROMPT_SIZES,
+        metavar="TOKENS",
+        help=(
+            "Prompt token sizes to benchmark "
+            f"(default: {' '.join(map(str, PROMPT_SIZES))})."
+        ),
+    )
+    parser.add_argument(
+        "--state-file",
+        type=os.path.abspath,
+        default=STATE_FILE,
+        metavar="PATH",
+        help=f"Benchmark state JSON path (default: {STATE_FILE}).",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Generate/merge cases and exit without running benchmarks.")
     parser.add_argument("--timeout-sec", type=int, default=DEFAULT_TIMEOUT_SEC, help="Per-case timeout in seconds.")
     parser.add_argument("--reset-state", action="store_true", help="Ignore existing benchmark.json and start a new state.")
+    parser.add_argument(
+        "--point-update",
+        action="store_true",
+        help="Rerun selected prompt sizes or exact --case-ids and update only those cached cases.",
+    )
+    parser.add_argument(
+        "--case-ids",
+        "--case-id",
+        dest="case_ids",
+        nargs="+",
+        type=non_negative_int,
+        default=None,
+        metavar="ID",
+        help=(
+            "With --point-update, rerun only these case IDs from the existing benchmark.json. "
+            "The case IDs determine the prompt sizes."
+        ),
+    )
+    parser.add_argument(
+        "--backend",
+        "--heterogeneity",
+        choices=["npu", "gpu", "hetero"],
+        default=None,
+        help="With --point-update, select a readable backend: npu, gpu, or hetero.",
+    )
+    parser.add_argument(
+        "--chunking",
+        type=boolean_arg,
+        default=None,
+        metavar="BOOL",
+        help="With --point-update, select chunking=true or chunking=false.",
+    )
+    parser.add_argument(
+        "--chunking-scheduled",
+        type=boolean_arg,
+        default=None,
+        metavar="BOOL",
+        help="With --point-update, select whether scheduled chunking is true or false.",
+    )
+    parser.add_argument(
+        "--minimal-pdi",
+        type=boolean_arg,
+        default=None,
+        metavar="BOOL",
+        help="With --point-update, select minimal PDI=true or minimal PDI=false.",
+    )
     parser.add_argument("--clean-temp", action="store_true", help="Skip benchmarks and delete benchmark temp artifacts (benchmark_run_*.log, *.bench.bak, benchmark.json).")
     return parser.parse_args()
 
 
 def main() -> None:
+    global BENCHMARK_DIR, LOG_FILE, STATE_FILE
+
     args = parse_args()
+    STATE_FILE = args.state_file
+    BENCHMARK_DIR = os.path.dirname(STATE_FILE)
+    os.makedirs(BENCHMARK_DIR, exist_ok=True)
+    LOG_FILE = os.path.join(
+        BENCHMARK_DIR,
+        f"benchmark_run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+    )
+
+    if args.point_update and args.reset_state:
+        print("Error: --point-update cannot be combined with --reset-state.")
+        sys.exit(2)
+    if args.point_update and args.dry_run:
+        print("Error: --point-update cannot be combined with --dry-run because no benchmark would run.")
+        sys.exit(2)
+    if args.case_ids and not args.point_update:
+        print("Error: --case-ids requires --point-update.")
+        sys.exit(2)
+    scenario_selectors = (
+        args.backend,
+        args.chunking,
+        args.chunking_scheduled,
+        args.minimal_pdi,
+    )
+    if any(value is not None for value in scenario_selectors) and not args.point_update:
+        print("Error: scenario selectors require --point-update.")
+        sys.exit(2)
+    if args.case_ids and any(value is not None for value in scenario_selectors):
+        print("Error: use either --case-ids or readable scenario selectors, not both.")
+        sys.exit(2)
 
     if args.clean_temp:
         removed_files, removed_refs, removed_baks, removed_state = cleanup_temp_log_files(STATE_FILE, run_log_path=None)
@@ -976,9 +1283,9 @@ def main() -> None:
         print("No models configured.")
         sys.exit(1)
 
-    model = next((m for m in MODELS if str(m.get("id", "")).strip() == MODEL), None)
+    model = next((m for m in MODELS if str(m.get("id", "")).strip() == args.model), None)
     if model is None:
-        print(f"Selected MODEL '{MODEL}' is not present in MODELS.")
+        print(f"Selected model '{args.model}' is not present in MODELS.")
         sys.exit(1)
     config_path, cpu_model_name = resolve_model_config_path_for_platform(model)
     if not os.path.exists(config_path):
@@ -996,7 +1303,21 @@ def main() -> None:
             log_print(f"Detected CPU model: {cpu_model_name or 'unknown'}", log_handle)
             log_print(f"Auto-selected config: {config_path}", log_handle)
 
-            effective_prompt_sizes = _get_effective_prompt_sizes(PROMPT_SIZES, model)
+            existing = None if args.reset_state else load_state(STATE_FILE)
+            selected_case_ids = None
+            selected_case_keys = None
+            if args.point_update and args.case_ids:
+                try:
+                    selected_case_ids, selected_case_keys, selected_prompt_sizes = (
+                        resolve_point_update_case_ids(existing, args.case_ids)
+                    )
+                except ValueError as exc:
+                    log_print(f"Error: {exc}", log_handle)
+                    sys.exit(2)
+                effective_prompt_sizes = _get_effective_prompt_sizes(selected_prompt_sizes, model)
+            else:
+                effective_prompt_sizes = _get_effective_prompt_sizes(args.prompt_sizes, model)
+
             fresh = build_initial_state(
                 model,
                 effective_prompt_sizes,
@@ -1005,22 +1326,82 @@ def main() -> None:
                 config_path,
                 cpu_model_name,
             )
-            existing = None if args.reset_state else load_state(STATE_FILE)
-            state = merge_state(existing, fresh) if isinstance(existing, dict) else fresh
+            if selected_case_keys is not None:
+                try:
+                    fresh = filter_fresh_cases_for_point_update(fresh, selected_case_keys)
+                except ValueError as exc:
+                    log_print(f"Error: {exc}", log_handle)
+                    sys.exit(2)
+            elif args.point_update and any(value is not None for value in scenario_selectors):
+                try:
+                    fresh = filter_fresh_cases_by_scenario(
+                        fresh,
+                        backend=args.backend,
+                        chunking=args.chunking,
+                        chunking_scheduled=args.chunking_scheduled,
+                        minimal_pdi=args.minimal_pdi,
+                    )
+                except ValueError as exc:
+                    log_print(f"Error: {exc}", log_handle)
+                    sys.exit(2)
+
+            active_case_keys = None
+            if args.point_update:
+                try:
+                    state, active_case_keys, point_update_resuming = merge_point_update_state(existing, fresh)
+                except ValueError as exc:
+                    log_print(f"Error: {exc}", log_handle)
+                    sys.exit(2)
+                if selected_case_ids is not None:
+                    state["point_update"]["case_ids"] = selected_case_ids
+                    state["point_update"].pop("selection", None)
+                    point_update_target = f"case IDs: {selected_case_ids}"
+                else:
+                    state["point_update"].pop("case_ids", None)
+                    point_update_target = format_point_update_scenario(
+                        effective_prompt_sizes,
+                        args.backend,
+                        args.chunking,
+                        args.chunking_scheduled,
+                        args.minimal_pdi,
+                    )
+                    state["point_update"]["selection"] = {
+                        "backend": args.backend,
+                        "chunking": args.chunking,
+                        "chunking_scheduled": args.chunking_scheduled,
+                        "minimal_pdi": args.minimal_pdi,
+                    }
+                log_print(
+                    f"Point update {'resuming' if point_update_resuming else 'started'} for "
+                    f"{point_update_target}; "
+                    f"preserved {len(state.get('cases', [])) - len(active_case_keys)} other cached cases.",
+                    log_handle,
+                )
+            else:
+                state = merge_state(existing, fresh) if isinstance(existing, dict) else fresh
             state["updated_at"] = iso_now()
             if LOG_FILE not in state.get("log_files", []):
                 state.setdefault("log_files", []).append(LOG_FILE)
 
             save_json_atomic(STATE_FILE, state)
 
-            total_cases = len(state.get("cases", []))
-            expected_cases = expected_case_count(effective_prompt_sizes, model)
-            if effective_prompt_sizes != [int(size) for size in PROMPT_SIZES]:
+            total_cases = (
+                len(active_case_keys)
+                if active_case_keys is not None
+                else len(state.get("cases", []))
+            )
+            expected_cases = (
+                len(fresh.get("cases", []))
+                if active_case_keys is not None
+                else expected_case_count(effective_prompt_sizes, model)
+            )
+            if selected_case_ids is None and effective_prompt_sizes != [int(size) for size in args.prompt_sizes]:
                 log_print(
-                    f"Applied model MAX_CTX={_model_max_ctx(model)} to prompt sizes: {PROMPT_SIZES} -> {effective_prompt_sizes}",
+                    f"Applied model MAX_CTX={_model_max_ctx(model)} to prompt sizes: {args.prompt_sizes} -> {effective_prompt_sizes}",
                     log_handle,
                 )
-            log_print(f"Generated case count: {total_cases}", log_handle)
+            case_count_label = "Point-update case count" if active_case_keys is not None else "Generated case count"
+            log_print(f"{case_count_label}: {total_cases}", log_handle)
             if total_cases != expected_cases:
                 log_print(f"Warning: expected {expected_cases} cases, found {total_cases}", log_handle)
 
@@ -1035,7 +1416,7 @@ def main() -> None:
             stop_due_to_failure = False
 
             try:
-                next_idx = find_next_case_index(state["cases"])
+                next_idx = find_next_case_index(state["cases"], active_case_keys)
                 if next_idx is None:
                     log_print("All cases already completed.", log_handle)
                 else:
@@ -1044,6 +1425,9 @@ def main() -> None:
                 idx = next_idx
                 while idx is not None and idx < len(state["cases"]):
                     case = state["cases"][idx]
+                    if active_case_keys is not None and case.get("key") not in active_case_keys:
+                        idx += 1
+                        continue
                     if case.get("status") == "done":
                         idx += 1
                         continue
@@ -1107,11 +1491,42 @@ def main() -> None:
                         stop_due_to_failure = True
                         break
 
-                    if any(c.get("status") != "done" for c in state["cases"][idx + 1 :]):
+                    if any(
+                        c.get("status") != "done"
+                        and (active_case_keys is None or c.get("key") in active_case_keys)
+                        for c in state["cases"][idx + 1 :]
+                    ):
                         log_print(f"Cooldown: sleeping {COOLDOWN_SEC} seconds before next case.", log_handle)
                         time.sleep(COOLDOWN_SEC)
 
                     idx += 1
+
+                if active_case_keys is not None and all(
+                    case.get("status") == "done"
+                    for case in state.get("cases", [])
+                    if case.get("key") in active_case_keys
+                ):
+                    point_update = state.get("point_update")
+                    if isinstance(point_update, dict):
+                        point_update["status"] = "complete"
+                        point_update["completed_at"] = iso_now()
+                        state["updated_at"] = iso_now()
+                        save_json_atomic(STATE_FILE, state)
+                        completed_target = (
+                            f"case IDs: {selected_case_ids}"
+                            if selected_case_ids is not None
+                            else format_point_update_scenario(
+                                effective_prompt_sizes,
+                                args.backend,
+                                args.chunking,
+                                args.chunking_scheduled,
+                                args.minimal_pdi,
+                            )
+                        )
+                        log_print(
+                            f"Point update complete for {completed_target}.",
+                            log_handle,
+                        )
 
                 all_prompt_cases_done = all(c.get("status") == "done" for c in state.get("cases", []))
                 if RUN_GEN and all_prompt_cases_done and not stop_due_to_timeout and not stop_due_to_failure:

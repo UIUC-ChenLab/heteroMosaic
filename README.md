@@ -1,8 +1,21 @@
-# Libraries Setup Guide
 
-Project paper: [heteroMosaic](https://arxiv.org/abs/2607.12839)
+# Setup Guide
+This guide provides the instructions required to set up, build, and run HeteroMosaic. It covers system prerequisites, kernel and GTT memory configuration, external library dependencies, environment setup, project compilation, and model execution.
 
-This guide describes how to replicate the `libraries` directory in a directory of your choosing, which contains the necessary external dependencies for building and running the project.
+## Reference
+
+For more details about HeteroMosaic, please see [heteroMosaic](https://arxiv.org/abs/2607.12839):
+
+Please cite our work if you find our code or paper useful to your work.
+```bibtex
+@inproceedings{jun2026heteromosaic,
+  title={HeteroMosaic: Exposing and Exploiting Heterogeneous Opportunities for Energy-Efficient Edge LLM Inference},
+  author={Jun, Gregory Hyegang and Pang, Wesley and Richter, Eddie and Saeedi, Mehdi and Amarnath, Aporva and Ferrao, Pallavi and Chen, Deming},
+  booktitle={2026 IEEE/ACM International Symposium on Microarchitecture (MICRO)},
+  month={October},
+  year={2026}
+}
+```
 
 ## Prerequisites
 
